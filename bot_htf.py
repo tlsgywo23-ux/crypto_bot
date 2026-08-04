@@ -80,8 +80,8 @@ def check_market():
             min_range_pct = 0.005
             has_enough_range = (candle_total_range / current_price) >= min_range_pct
             
-            # 4. 직전 10개 봉 중에서 가장 고점인지 확인
-            recent_highs = df['high'].iloc[idx-10:idx]
+            # 4. 직전 10개 봉 중에서 가장 고점인지 확인 (정확한 10개 범위: idx-10부터 idx+1 전까지)
+            recent_highs = df['high'].iloc[idx-10:idx+1]
             is_highest = c_high >= recent_highs.max()
             
             # 조건 만족 시 텔레그램 알림 발송
