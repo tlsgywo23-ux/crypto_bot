@@ -48,6 +48,7 @@ def check_market():
                 
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             
+            # 직전 완성된 캔들 기준 (인덱스 -2 봉)
             idx = -2
             c_open = df['open'].iloc[idx]
             c_high = df['high'].iloc[idx]
@@ -68,7 +69,8 @@ def check_market():
             min_range_pct = 0.005
             has_enough_range = (candle_total_range / current_price) >= min_range_pct
             
-            recent_lows = df['low'].iloc[idx-10:idx]
+            # 직전 10개 봉 저점 비교 정확하게 수정 (idx-10부터 idx-1까지 포함)
+            recent_lows = df['low'].iloc[idx-10:idx+1]
             is_lowest = c_low <= recent_lows.min()
             
             if is_bullish and is_hammer and has_enough_range and is_lowest:
