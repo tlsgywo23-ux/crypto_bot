@@ -245,16 +245,22 @@ def check_symbol_timeframe(exchange, symbol, state, tf_conf, candles_cache):
 
 
 def check_all_symbols(exchange: ccxt.okx, symbols, state: dict):
-    """모든 타임프레임 x 모든 신호 조합을 심볼별로 체크"""
+    """모든 타임프레임 x 모든 신호 조합을 심볼별로 체크
+
+    타임프레임 하나에서 오류(네트워크 순단 등)가 나도 같은 심볼의
+    나머지 타임프레임 체크는 계속 진행되도록, try/except를 타임프레임
+    단위로 감쌉니다. (심볼 단위로 감싸면 15m에서 에러 시 1h/4h까지
+    이번 회차에서 통째로 스킵되는 문제가 있었음)
+    """
     for symbol in symbols:
         candles_cache = {}
-        try:
-            for tf_conf in TIMEFRAMES:
+        for tf_conf in TIMEFRAMES:
+            try:
                 check_symbol_timeframe(exchange, symbol, state, tf_conf, candles_cache)
-        except ccxt.BaseError as e:
-            log.error("[%s] ccxt 오류: %s", symbol, e)
-        except Exception as e:
-            log.error("[%s] 알 수 없는 오류: %s", symbol, e)
+            except ccxt.BaseError as e:
+                log.error("[%s|%s] ccxt 오류: %s", symbol, tf_conf["tf"], e)
+            except Exception as e:
+                log.error("[%s|%s] 알 수 없는 오류: %s", symbol, tf_conf["tf"], e)
 
 
 # ============================== SCHEDULER ==============================
