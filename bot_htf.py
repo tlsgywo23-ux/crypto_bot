@@ -46,7 +46,7 @@ def check_market():
             continue
 
         try:
-            # [변경점] 1시간봉(1h) 데이터 가져오기
+            # 1시간봉(1h) 데이터 가져오기
             ohlcv = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=30)
             if not ohlcv or len(ohlcv) < 20:
                 continue
@@ -72,8 +72,8 @@ def check_market():
             if body_size == 0:
                 continue
 
-            # 역망치 조건
-            is_inverted_hammer = (upper_wick >= body_size * 2) and (lower_wick <= body_size * 0.5)
+            # [조건 수정] 윗꼬리가 존재하고(0보다 큼), 아랫꼬리는 몸통의 0.5배 이하인 역망치 형태
+            is_inverted_hammer = (upper_wick > 0) and (lower_wick <= body_size * 0.5)
             
             # 3. 캔들 전체 길이 0.5% 이상 확인
             current_price = c_close
@@ -93,7 +93,7 @@ def check_market():
                     f"• 코인: `{symbol}`\n"
                     f"• 가격(종가): `{current_price}`\n"
                     f"• 윗꼬리 크기: `종가 ~ 최고가까지 +{wick_pct:.2f}%`\n"
-                    f"• 특징: 직전 10개 봉 중 최고점 / 윗꼬리 2배 이상 / 변동성 0.5% 초과 음봉"
+                    f"• 특징: 직전 10개 봉 중 최고점 / 역망치 음봉 / 변동성 0.5% 초과"
                 )
                 send_telegram_message(msg)
                 
