@@ -1,21 +1,5 @@
 """
 OKX 무기한 선물(perpetual swap) 15분봉 캔들 신호 감시 봇
-----------------------------------------------------------
-[신호 조건] 15분봉이 마감된 직후, 그 캔들이
-  1) 직전 14개 캔들 + 자기 자신, 총 15개 캔들 중 고가(꼬리 포함)가 가장 높고
-  2) 음봉(종가 < 시가)이며
-  3) 윗꼬리 길이 >= 몸통 길이 (역망치형 모양)
-인 경우 텔레그램으로 알람을 보낸다.
-
-필요 패키지 설치:
-    pip install ccxt requests --break-system-packages
-
-실행 전 아래 CONFIG 섹션의 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 를 채워 넣을 것.
-(이미 세팅된 텔레그램 봇의 토큰과, 알람을 받을 chat_id)
-
-실행:
-    python3 okx_candle_alert.py
-    (계속 떠 있어야 하는 프로세스이므로 서버에서는 nohup / systemd / screen / tmux 등으로 상시 구동 권장)
 """
 
 import ccxt
@@ -23,23 +7,21 @@ import requests
 import time
 import datetime
 import logging
+import os
+import json
+import argparse
 
 # ============================== CONFIG ==============================
 
-TELEGRAM_BOT_TOKEN = "여기에_봇_토큰_입력"
-TELEGRAM_CHAT_ID = "여기에_챗ID_입력"
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "여기에_봇_토큰_입력")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "여기에_챗ID_입력")
 
 TIMEFRAME = "15m"
 TIMEFRAME_MS = 15 * 60 * 1000
-
-# 최근 몇 개 캔들 중 "신고점"인지 판단할지 (요청: 직전 15개 캔들, 자기 자신 포함)
 LOOKBACK = 15
-
-# 캔들 마감 후 거래소 데이터 반영 대기 시간(초). 너무 짧으면 OKX가 아직
-# 해당 봉을 확정하지 않은 상태로 조회될 수 있어 여유를 둔다.
 CLOSE_BUFFER_SEC = 12
+STATE_FILE = os.environ.get("STATE_FILE", "alert_state.json")
 
-# 감시할 티커 목록 (OKX 무기한 선물 기준 base 심볼, USDT 마진)
 RAW_SYMBOLS = [
     "BTC", "ETH", "ZEC", "MU", "BCH", "LINK", "BEAT", "SOL", "SOXL", "LAB",
     "NEAR", "XRP", "SUI", "ONDO", "WLD", "ALLO", "H", "OPN", "CRV", "DOGE",
@@ -82,8 +64,6 @@ def build_exchange() -> ccxt.okx:
 
 
 def resolve_symbols(exchange: ccxt.okx, raw_symbols):
-    """RAW_SYMBOLS를 ccxt 통합 심볼(BASE/USDT:USDT)로 매핑하고,
-    실제 OKX에 없는 티커는 걸러서 경고만 남긴다."""
     exchange.load_markets()
     resolved = []
     missing = []
@@ -95,28 +75,45 @@ def resolve_symbols(exchange: ccxt.okx, raw_symbols):
             missing.append(sym)
     if missing:
         log.warning(
-            "OKX 무기한선물(USDT 마진)에서 찾지 못한 티커 (심볼명이 다르거나 상장되지 않음): %s",
+            "OKX 무기한선물(USDT 마진)에서 찾지 못한 티커: %s",
             ", ".join(missing),
         )
     log.info("감시 대상 %d개 심볼 확정: %s", len(resolved), ", ".join(resolved))
     return resolved
 
 
+# ============================== STATE (중복 알람 방지) ==============================
+
+
+def load_state():
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r") as f:
+                return json.load(f)
+        except Exception as e:
+            log.warning("상태 파일 로드 실패, 빈 상태로 시작: %s", e)
+    return {}
+
+
+def save_state(state):
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f)
+    except Exception as e:
+        log.error("상태 파일 저장 실패: %s", e)
+
+
 # ============================== CORE LOGIC ==============================
 
 
 def fetch_closed_candles(exchange: ccxt.okx, symbol: str, count: int):
-    """마감이 완료된 캔들만 최신순으로 count개 반환 (가장 마지막 원소가 가장 최근 마감봉)."""
     now_ms = exchange.milliseconds()
     raw = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=count + 2)
-    # raw candle: [timestamp, open, high, low, close, volume]
     closed = [c for c in raw if c[0] + TIMEFRAME_MS <= now_ms]
     return closed[-count:]
 
 
 def check_signal(candles):
-    """candles: 마감된 캔들 리스트, 마지막 원소가 방금 마감된 캔들.
-    len(candles) >= LOOKBACK 이어야 함."""
     if len(candles) < LOOKBACK:
         return False, None
 
@@ -124,21 +121,17 @@ def check_signal(candles):
     current = window[-1]
     _, o, h, l, c, v = current
 
-    # 1) 최근 LOOKBACK개(자기 자신 포함) 중 고가 최고
     max_high = max(cd[2] for cd in window)
-    is_new_high = h >= max_high  # 부동소수 오차 대비 >=
+    is_new_high = h >= max_high
 
-    # 2) 음봉
     is_bearish = c < o
 
-    # 3) 윗꼬리 >= 몸통
     body = abs(c - o)
     upper_wick = h - max(o, c)
     is_inverted_hammer_shape = upper_wick >= body
 
     ok = is_new_high and is_bearish and is_inverted_hammer_shape
 
-    # 고가 대비 종가가 몇 % 아래에서 마감했는지 (고가 기준)
     high_close_diff_pct = ((h - c) / h * 100) if h != 0 else 0.0
 
     detail = {
@@ -150,10 +143,17 @@ def check_signal(candles):
     return ok, detail
 
 
-def check_all_symbols(exchange: ccxt.okx, symbols):
+def check_all_symbols(exchange: ccxt.okx, symbols, state: dict):
     for symbol in symbols:
         try:
             candles = fetch_closed_candles(exchange, symbol, LOOKBACK)
+            if not candles:
+                continue
+            latest_candle_ts = candles[-1][0]
+
+            if state.get(symbol) == latest_candle_ts:
+                continue
+
             ok, detail = check_signal(candles)
             if ok:
                 candle_time = datetime.datetime.fromtimestamp(
@@ -172,6 +172,8 @@ def check_all_symbols(exchange: ccxt.okx, symbols):
                 )
                 log.info("신호 발생: %s", symbol)
                 send_telegram(msg)
+
+            state[symbol] = latest_candle_ts
         except ccxt.BaseError as e:
             log.error("[%s] ccxt 오류: %s", symbol, e)
         except Exception as e:
@@ -182,7 +184,6 @@ def check_all_symbols(exchange: ccxt.okx, symbols):
 
 
 def seconds_until_next_close():
-    """UTC 기준 다음 15분 봉 마감 시각(:00, :15, :30, :45)까지 남은 초 + 여유버퍼."""
     interval_sec = 15 * 60
     now_epoch = time.time()
     next_close_epoch = (int(now_epoch // interval_sec) + 1) * interval_sec
@@ -190,13 +191,27 @@ def seconds_until_next_close():
     return wait + CLOSE_BUFFER_SEC
 
 
-def main():
+def run_once():
     exchange = build_exchange()
     symbols = resolve_symbols(exchange, RAW_SYMBOLS)
     if not symbols:
-        log.error("감시할 심볼이 하나도 없습니다. RAW_SYMBOLS를 확인하세요.")
+        log.error("감시할 심볼이 하나도 없습니다.")
         return
 
+    state = load_state()
+    log.info("1회성 체크 실행 (%d개 심볼)", len(symbols))
+    check_all_symbols(exchange, symbols, state)
+    save_state(state)
+
+
+def run_loop():
+    exchange = build_exchange()
+    symbols = resolve_symbols(exchange, RAW_SYMBOLS)
+    if not symbols:
+        log.error("감시할 심볼이 하나도 없습니다.")
+        return
+
+    state = load_state()
     log.info("15분봉 감시를 시작합니다. (%d개 심볼)", len(symbols))
 
     while True:
@@ -204,7 +219,19 @@ def main():
         log.info("다음 15분봉 마감까지 %.0f초 대기", wait_sec)
         time.sleep(wait_sec)
         log.info("캔들 마감 감지 → 전 종목 조건 체크 시작")
-        check_all_symbols(exchange, symbols)
+        check_all_symbols(exchange, symbols, state)
+        save_state(state)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="OKX 15분봉 캔들 신호 감시 봇")
+    parser.add_argument("--once", action="store_true", help="1회만 체크하고 종료")
+    args = parser.parse_args()
+
+    if args.once:
+        run_once()
+    else:
+        run_loop()
 
 
 if __name__ == "__main__":
