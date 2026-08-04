@@ -13,18 +13,25 @@ def send_telegram_message(message):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
     try:
-        requests.post(url, json=payload)
+        requests.post(url, json=payload, timeout=10)
     except Exception as e:
         print(f"Failed to send telegram message: {e}")
 
 def check_market():
-    # OKX 거래소 객체 생성 (영구선물 swap 마켓 지정)
+    # OKX 거래소 객체 생성 (영구선물 swap 마켓 지정 및 레이트 리밋 활성화)
     exchange = ccxt.okx({
         'options': {'defaultType': 'swap'},
         'enableRateLimit': True
     })
     
-    # 전달해주신 40개 코인 심볼 리스트
+    # 1. OKX 선물 마켓 정보 미리 로드 (심볼 오류 원천 차단)
+    try:
+        exchange.load_markets()
+    except Exception as e:
+        print(f"Failed to load OKX markets: {e}")
+        return
+
+    # 감시할 원본 코인 심볼 리스트 (소문자 입력 시 대문자 변환 및 표준 포맷 매핑)
     raw_symbols = [
         'btc', 'eth', 'zec', 'mu', 'bch', 'link', 'beat', 'sol', 'soxl', 'lab', 
         'near', 'xrp', 'sui', 'ondo', 'wld', 'allo', 'h', 'opn', 'crv', 'doge', 
@@ -32,10 +39,13 @@ def check_market():
         're', 'ada', 'o', 'based', 'hype', 'slx', 'nes', 'cap', 'litu', 'bnb'
     ]
     
-    # OKX 선물 마켓 심볼 표준 포맷으로 변환
-    symbols = [f"{s.upper()}/USDT:USDT" for s in raw_symbols]
+    for s in raw_symbols:
+        symbol = f"{s.upper()}/USDT:USDT"
+        
+        # 거래소에 실제 존재하는 심볼인지 먼저 확인하여 불필요한 에러 방지
+        if symbol not in exchange.markets:
+            continue
 
-    for symbol in symbols:
         try:
             # 15분봉 데이터 30개 가져오기
             ohlcv = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=30)
@@ -56,7 +66,6 @@ def check_market():
             
             # 2. 몸통과 꼬리 계산
             body_size = abs(c_close - c_open)
-            # 음봉이므로 시가가 몸통의 위쪽, 종가가 아래쪽
             upper_wick = c_high - c_open
             lower_wick = c_close - c_low
             candle_total_range = c_high - c_low
@@ -73,22 +82,25 @@ def check_market():
             min_range_pct = 0.005 # 0.5%
             has_enough_range = (candle_total_range / current_price) >= min_range_pct
             
-            # 4. 직전 10개 봉 중에서 가장 고점인지 확인 (인덱스 기준 직전 10개의 high 값)
+            # 4. 직전 10개 봉 중에서 가장 고점인지 확인
             recent_highs = df['high'].iloc[idx-10:idx]
             is_highest = c_high >= recent_highs.max()
             
             # 모든 조건 만족 시 텔레그램 알림 발송
             if is_bearish and is_inverted_hammer and has_enough_range and is_highest:
+                # 종가(c_close)에서 윗꼬리 최고가(c_high)까지의 퍼센트 계산
+                wick_pct = ((c_high - c_close) / c_close) * 100
+                
                 msg = (
                     f"🚨 *[OKX 선물] 15분봉 역망치 포착!*\n"
                     f"• 코인: `{symbol}`\n"
-                    f"• 가격: `{current_price}`\n"
+                    f"• 가격(종가): `{current_price}`\n"
+                    f"• 윗꼬리 크기: `종가 ~ 최고가까지 +{wick_pct:.2f}%`\n"
                     f"• 특징: 직전 10개 봉 중 최고점 / 윗꼬리 2배 이상 / 변동성 0.5% 초과 음봉"
                 )
                 send_telegram_message(msg)
                 
         except Exception as e:
-            # 특정 종목 조회 중 문제가 생겨도 전체 봇이 멈추지 않고 다음 코인으로 넘어갑니다
             print(f"Error processing {symbol}: {e}")
 
 if __name__ == "__main__":
