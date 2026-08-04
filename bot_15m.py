@@ -89,7 +89,7 @@ def check_market():
                 wick_pct = ((c_open - c_low) / c_close) * 100
                 
                 msg = (
-                    f"🚨 *[OKX 선물] 15분봉 망치형 양봉 포착!*\n"
+                    f"🟢 *[OKX 선물] 15분봉 망치형 양봉 포착!*\n"
                     f"• 코인: `{symbol}`\n"
                     f"• 가격(종가): `{current_price}`\n"
                     f"• 아랫꼬리 크기: `저가 ~ 시가까지 +{wick_pct:.2f}%`\n"
