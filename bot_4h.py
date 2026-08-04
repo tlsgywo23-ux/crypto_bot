@@ -60,43 +60,35 @@ def check_market():
             c_low = df['low'].iloc[idx]
             c_close = df['close'].iloc[idx]
             
-            # 1. 음봉 확인 (종가가 시가보다 낮음)
+            # 1. 음봉 확인
             is_bearish = c_close < c_open
             
-            # 2. 몸통과 꼬리 정밀 계산 (음봉이므로 몸통 상단은 c_open, 하단은 c_close)
-            body_top = c_open
-            body_bottom = c_close
-            body_size = body_top - body_bottom
-            
-            if body_size <= 0:
-                continue
-
-            upper_wick = c_high - body_top
-            lower_wick = body_bottom - c_low
+            # 2. 몸통과 꼬리 계산
+            body_size = abs(c_close - c_open)
+            upper_wick = c_high - c_open
+            lower_wick = c_close - c_low
             candle_total_range = c_high - c_low
             
-            # [조건 수정] 역망치 정의 강화: 윗꼬리가 몸통보다 길거나 같고(>=), 아랫꼬리는 몸통의 0.5배 이하
-            # (만약 윗꼬리가 몸통보다 확실히 길어야 하는 조건을 주려면 upper_wick >= body_size * 1.0 등으로 조절 가능)
-            is_inverted_hammer = (upper_wick >= body_size) and (lower_wick <= body_size * 0.5)
+            if body_size == 0:
+                continue
+
+            # [조건 적용] 윗꼬리가 존재하고(0보다 큼), 아랫꼬리는 몸통의 0.5배 이하인 역망치 형태
+            is_inverted_hammer = (upper_wick > 0) and (lower_wick <= body_size * 0.5)
             
             # 3. 캔들 전체 길이 0.5% 이상 확인
             current_price = c_close
             min_range_pct = 0.005
             has_enough_range = (candle_total_range / current_price) >= min_range_pct
             
-            # 4. 직전 10개 봉 중에서 가장 고점인지 확인 (고가 기준)
+            # 4. 직전 10개 봉 중에서 가장 고점인지 확인 (정확한 10개 범위: idx-10부터 idx+1 전까지)
             recent_highs = df['high'].iloc[idx-10:idx+1]
             is_highest = c_high >= recent_highs.max()
             
-            # 디버깅용 로그 (EDGE 심볼 등의 상태를 확인하기 위함)
-            if symbol == 'EDGE/USDT:USDT':
-                print(f"[{symbol}] Bearish:{is_bearish}, Hammer:{is_inverted_hammer}, Range:{has_enough_range}, Highest:{is_highest}")
-                print(f"-> 윗꼬리:{upper_wick:.4f}, 몸통:{body_size:.4f}, 아랫꼬리:{lower_wick:.4f}")
-
             # 조건 만족 시 텔레그램 알림 발송
             if is_bearish and is_inverted_hammer and has_enough_range and is_highest:
                 wick_pct = ((c_high - c_close) / c_close) * 100
                 
+                # 마크다운 충돌 방지를 위해 특수문자 처리를 깔끔하게 정리한 메시지
                 msg = (
                     f"🚨 *[OKX 선물] 4시간봉 역망치 포착!*\n"
                     f"• 코인: `{symbol}`\n"
