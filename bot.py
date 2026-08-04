@@ -1,5 +1,7 @@
 """
-OKX 무기한 선물(perpetual swap) 15분봉 캔들 신호 감시 봇
+OKX 무기한 선물(perpetual swap) 캔들 신호 감시 봇
+- 타임프레임: 15분봉 / 1시간봉 / 4시간봉
+- 신호 패턴: 역망치형 음봉(고점 갱신 실패형 매도세) / 망치형 양봉(저점 갱신 후 매수세)
 """
 
 import ccxt
@@ -16,10 +18,17 @@ import argparse
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "여기에_봇_토큰_입력")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "여기에_챗ID_입력")
 
-TIMEFRAME = "15m"
-TIMEFRAME_MS = 15 * 60 * 1000
-LOOKBACK = 15
+# 감시할 타임프레임 목록
+TIMEFRAMES = [
+    {"tf": "15m", "ms": 15 * 60 * 1000, "lookback": 15},
+    {"tf": "1h", "ms": 60 * 60 * 1000, "lookback": 15},
+    {"tf": "4h", "ms": 4 * 60 * 60 * 1000, "lookback": 15},
+]
+
+# 루프 모드에서 깨어나는 주기(초). 가장 짧은 타임프레임(15m) 기준.
+TICK_INTERVAL_SEC = 15 * 60
 CLOSE_BUFFER_SEC = 12
+
 STATE_FILE = os.environ.get("STATE_FILE", "alert_state.json")
 
 RAW_SYMBOLS = [
@@ -103,77 +112,145 @@ def save_state(state):
         log.error("상태 파일 저장 실패: %s", e)
 
 
-# ============================== CORE LOGIC ==============================
+def state_key(symbol: str, timeframe: str, signal_id: str) -> str:
+    return f"{symbol}|{timeframe}|{signal_id}"
 
 
-def fetch_closed_candles(exchange: ccxt.okx, symbol: str, count: int):
-    now_ms = exchange.milliseconds()
-    raw = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=count + 2)
-    closed = [c for c in raw if c[0] + TIMEFRAME_MS <= now_ms]
-    return closed[-count:]
+# ============================== SIGNAL DEFINITIONS ==============================
+#
+# 두 신호 모두 "최근 N개 캔들 구간 내 극값 갱신 + 반대 방향 마감 + 갱신 방향 꼬리가
+# 몸통보다 크거나 같음" 이라는 동일한 뼈대를 공유하고, 방향만 반대입니다.
+#
+#  - 역망치 음봉(inverted_hammer_bearish):
+#      구간 신고가 + 음봉(종가<시가) + 윗꼬리 >= 몸통  → 상단에서 매도세 유입 신호
+#  - 망치 양봉(hammer_bullish):
+#      구간 신저가 + 양봉(종가>시가) + 아랫꼬리 >= 몸통 → 하단에서 매수세 유입 신호
 
 
-def check_signal(candles):
-    if len(candles) < LOOKBACK:
+def check_inverted_hammer_bearish(candles, lookback: int):
+    if len(candles) < lookback:
         return False, None
 
-    window = candles[-LOOKBACK:]
-    current = window[-1]
-    _, o, h, l, c, v = current
+    window = candles[-lookback:]
+    _, o, h, l, c, v = window[-1]
 
     max_high = max(cd[2] for cd in window)
-    is_new_high = h >= max_high
-
-    is_bearish = c < o
+    is_new_extreme = h >= max_high
+    is_directional = c < o  # 음봉
 
     body = abs(c - o)
-    upper_wick = h - max(o, c)
-    is_inverted_hammer_shape = upper_wick >= body
+    wick = h - max(o, c)  # 윗꼬리
+    is_shape_ok = wick >= body
 
-    ok = is_new_high and is_bearish and is_inverted_hammer_shape
-
-    high_close_diff_pct = ((h - c) / h * 100) if h != 0 else 0.0
+    ok = is_new_extreme and is_directional and is_shape_ok
+    extreme_diff_pct = ((h - c) / h * 100) if h != 0 else 0.0
 
     detail = {
         "open": o, "high": h, "low": l, "close": c,
-        "body": body, "upper_wick": upper_wick,
-        "is_new_high": is_new_high,
-        "high_close_diff_pct": high_close_diff_pct,
+        "body": body, "wick": wick, "wick_label": "윗꼬리",
+        "extreme_label": "신고가",
+        "extreme_diff_pct": extreme_diff_pct,
+        "extreme_diff_label": "고가 대비 종가 하락률",
+        "condition_label": "신고가 + 음봉 + 역망치형",
     }
     return ok, detail
 
 
+def check_hammer_bullish(candles, lookback: int):
+    if len(candles) < lookback:
+        return False, None
+
+    window = candles[-lookback:]
+    _, o, h, l, c, v = window[-1]
+
+    min_low = min(cd[3] for cd in window)
+    is_new_extreme = l <= min_low
+    is_directional = c > o  # 양봉
+
+    body = abs(c - o)
+    wick = min(o, c) - l  # 아랫꼬리
+    is_shape_ok = wick >= body
+
+    ok = is_new_extreme and is_directional and is_shape_ok
+    extreme_diff_pct = ((c - l) / l * 100) if l != 0 else 0.0
+
+    detail = {
+        "open": o, "high": h, "low": l, "close": c,
+        "body": body, "wick": wick, "wick_label": "아랫꼬리",
+        "extreme_label": "신저가",
+        "extreme_diff_pct": extreme_diff_pct,
+        "extreme_diff_label": "저가 대비 종가 상승률",
+        "condition_label": "신저가 + 양봉 + 망치형",
+    }
+    return ok, detail
+
+
+SIGNALS = [
+    {"id": "inv_hammer_bear", "emoji": "🔻", "name": "역망치 음봉", "fn": check_inverted_hammer_bearish},
+    {"id": "hammer_bull", "emoji": "🔨", "name": "망치 양봉", "fn": check_hammer_bullish},
+]
+
+# ============================== CORE LOGIC ==============================
+
+
+def fetch_closed_candles(exchange: ccxt.okx, symbol: str, timeframe: str, timeframe_ms: int, count: int):
+    now_ms = exchange.milliseconds()
+    raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=count + 2)
+    closed = [c for c in raw if c[0] + timeframe_ms <= now_ms]
+    return closed[-count:]
+
+
+def check_symbol_timeframe(exchange, symbol, state, tf_conf, candles_cache):
+    """한 심볼 x 한 타임프레임에 대해 캔들을 가져와서 등록된 모든 신호를 체크"""
+    timeframe = tf_conf["tf"]
+    timeframe_ms = tf_conf["ms"]
+    lookback = tf_conf["lookback"]
+
+    cache_key = (symbol, timeframe)
+    if cache_key not in candles_cache:
+        candles_cache[cache_key] = fetch_closed_candles(
+            exchange, symbol, timeframe, timeframe_ms, lookback
+        )
+    candles = candles_cache[cache_key]
+    if not candles:
+        return
+
+    latest_candle_ts = candles[-1][0]
+    candle_time = datetime.datetime.fromtimestamp(
+        latest_candle_ts / 1000, tz=datetime.timezone.utc
+    ).strftime("%Y-%m-%d %H:%M UTC")
+
+    for sig in SIGNALS:
+        key = state_key(symbol, timeframe, sig["id"])
+        if state.get(key) == latest_candle_ts:
+            continue
+
+        ok, detail = sig["fn"](candles, lookback)
+        if ok:
+            msg = (
+                f"{sig['emoji']} <b>{symbol}</b> [{timeframe}] {sig['name']} 신호 발생\n"
+                f"캔들 마감시각: {candle_time}\n"
+                f"시가: {detail['open']:.6g}\n"
+                f"고가: {detail['high']:.6g}\n"
+                f"저가: {detail['low']:.6g}\n"
+                f"종가: {detail['close']:.6g}\n"
+                f"몸통: {detail['body']:.6g} / {detail['wick_label']}: {detail['wick']:.6g}\n"
+                f"{detail['extreme_diff_label']}: {detail['extreme_diff_pct']:.2f}%\n"
+                f"조건: 최근 {lookback}개 [{timeframe}] 캔들 중 {detail['condition_label']}"
+            )
+            log.info("신호 발생: %s [%s] %s", symbol, timeframe, sig["name"])
+            send_telegram(msg)
+
+        state[key] = latest_candle_ts
+
+
 def check_all_symbols(exchange: ccxt.okx, symbols, state: dict):
+    """모든 타임프레임 x 모든 신호 조합을 심볼별로 체크"""
     for symbol in symbols:
+        candles_cache = {}
         try:
-            candles = fetch_closed_candles(exchange, symbol, LOOKBACK)
-            if not candles:
-                continue
-            latest_candle_ts = candles[-1][0]
-
-            if state.get(symbol) == latest_candle_ts:
-                continue
-
-            ok, detail = check_signal(candles)
-            if ok:
-                candle_time = datetime.datetime.fromtimestamp(
-                    candles[-1][0] / 1000, tz=datetime.timezone.utc
-                ).strftime("%Y-%m-%d %H:%M UTC")
-                msg = (
-                    f"🔻 <b>{symbol}</b> 15분봉 신호 발생\n"
-                    f"캔들 마감시각: {candle_time}\n"
-                    f"시가: {detail['open']:.6g}\n"
-                    f"고가: {detail['high']:.6g}\n"
-                    f"저가: {detail['low']:.6g}\n"
-                    f"종가: {detail['close']:.6g}\n"
-                    f"몸통: {detail['body']:.6g} / 윗꼬리: {detail['upper_wick']:.6g}\n"
-                    f"고가 대비 종가 하락률: -{detail['high_close_diff_pct']:.2f}%\n"
-                    f"조건: 최근 {LOOKBACK}개 캔들 중 신고가 + 음봉 + 역망치형"
-                )
-                log.info("신호 발생: %s", symbol)
-                send_telegram(msg)
-
-            state[symbol] = latest_candle_ts
+            for tf_conf in TIMEFRAMES:
+                check_symbol_timeframe(exchange, symbol, state, tf_conf, candles_cache)
         except ccxt.BaseError as e:
             log.error("[%s] ccxt 오류: %s", symbol, e)
         except Exception as e:
@@ -184,7 +261,7 @@ def check_all_symbols(exchange: ccxt.okx, symbols, state: dict):
 
 
 def seconds_until_next_close():
-    interval_sec = 15 * 60
+    interval_sec = TICK_INTERVAL_SEC
     now_epoch = time.time()
     next_close_epoch = (int(now_epoch // interval_sec) + 1) * interval_sec
     wait = next_close_epoch - now_epoch
@@ -199,7 +276,12 @@ def run_once():
         return
 
     state = load_state()
-    log.info("1회성 체크 실행 (%d개 심볼)", len(symbols))
+    log.info(
+        "1회성 체크 실행 (%d개 심볼, 타임프레임: %s, 신호: %s)",
+        len(symbols),
+        ", ".join(t["tf"] for t in TIMEFRAMES),
+        ", ".join(s["name"] for s in SIGNALS),
+    )
     check_all_symbols(exchange, symbols, state)
     save_state(state)
 
@@ -212,19 +294,24 @@ def run_loop():
         return
 
     state = load_state()
-    log.info("15분봉 감시를 시작합니다. (%d개 심볼)", len(symbols))
+    log.info(
+        "캔들 감시를 시작합니다. (%d개 심볼, 타임프레임: %s, 신호: %s)",
+        len(symbols),
+        ", ".join(t["tf"] for t in TIMEFRAMES),
+        ", ".join(s["name"] for s in SIGNALS),
+    )
 
     while True:
         wait_sec = seconds_until_next_close()
-        log.info("다음 15분봉 마감까지 %.0f초 대기", wait_sec)
+        log.info("다음 체크 틱까지 %.0f초 대기", wait_sec)
         time.sleep(wait_sec)
-        log.info("캔들 마감 감지 → 전 종목 조건 체크 시작")
+        log.info("틱 발생 → 전 타임프레임/전 신호/전 종목 조건 체크 시작")
         check_all_symbols(exchange, symbols, state)
         save_state(state)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="OKX 15분봉 캔들 신호 감시 봇")
+    parser = argparse.ArgumentParser(description="OKX 캔들 신호 감시 봇 (15m/1h/4h, 역망치음봉/망치양봉)")
     parser.add_argument("--once", action="store_true", help="1회만 체크하고 종료")
     args = parser.parse_args()
 
