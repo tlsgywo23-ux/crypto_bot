@@ -2,6 +2,13 @@
 OKX 무기한 선물(perpetual swap) 캔들 신호 감시 봇
 - 타임프레임: 15분봉 / 1시간봉 / 4시간봉
 - 신호 패턴: 역망치형 음봉(고점 갱신 실패형 매도세) / 망치형 양봉(저점 갱신 후 매수세)
+
+[알람 빈도 완화 버전]
+- 캔들 모양 조건을 "꼬리 >= 몸통"(느슨함) → 표준 망치/역망치 비율 기준으로 강화
+  (레인지 대비 몸통 30% 이하, 주요 꼬리 60% 이상, 반대 꼬리 15% 이하)
+- lookback을 타임프레임별로 늘려서 너무 짧은 구간의 신고가/신저가에는 반응하지 않도록 함
+  (15m: 15→20 / 1h: 15→24 / 4h: 15→30)
+- 아래 SHAPE_* 상수를 조절해서 민감도를 더 세밀하게 튜닝할 수 있습니다.
 """
 
 import ccxt
@@ -19,15 +26,24 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "여기에_봇_토큰_
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "여기에_챗ID_입력")
 
 # 감시할 타임프레임 목록
+# lookback을 늘려서(타임프레임별로 의미있는 구간이 되도록) 너무 잦은 "신고가/신저가 갱신"을
+# 신호로 인정하지 않도록 함.
 TIMEFRAMES = [
-    {"tf": "15m", "ms": 15 * 60 * 1000, "lookback": 15},
-    {"tf": "1h", "ms": 60 * 60 * 1000, "lookback": 15},
-    {"tf": "4h", "ms": 4 * 60 * 60 * 1000, "lookback": 15},
+    {"tf": "15m", "ms": 15 * 60 * 1000, "lookback": 20},   # 약 5시간 구간
+    {"tf": "1h", "ms": 60 * 60 * 1000, "lookback": 24},    # 약 1일 구간
+    {"tf": "4h", "ms": 4 * 60 * 60 * 1000, "lookback": 30},  # 약 5일 구간
 ]
 
 # 루프 모드에서 깨어나는 주기(초). 가장 짧은 타임프레임(15m) 기준.
 TICK_INTERVAL_SEC = 15 * 60
 CLOSE_BUFFER_SEC = 12
+
+# --- 캔들 모양(망치/역망치) 판정 기준 ---
+# 전체 레인지(고가-저가) 대비 비율로 판정. 값을 낮추면(예: WICK_RATIO_MIN을 낮추면)
+# 신호가 더 자주 뜨고, 높이면 더 엄격해져서 알람이 줄어듭니다.
+SHAPE_BODY_RATIO_MAX = 0.30       # 몸통은 전체 레인지의 30% 이하여야 함
+SHAPE_MAIN_WICK_RATIO_MIN = 0.60  # 주요 꼬리는 전체 레인지의 60% 이상이어야 함
+SHAPE_OPPOSITE_WICK_RATIO_MAX = 0.15  # 반대쪽 꼬리는 전체 레인지의 15% 이하여야 함 (도지형 배제)
 
 STATE_FILE = os.environ.get("STATE_FILE", "alert_state.json")
 
@@ -118,13 +134,39 @@ def state_key(symbol: str, timeframe: str, signal_id: str) -> str:
 
 # ============================== SIGNAL DEFINITIONS ==============================
 #
-# 두 신호 모두 "최근 N개 캔들 구간 내 극값 갱신 + 반대 방향 마감 + 갱신 방향 꼬리가
-# 몸통보다 크거나 같음" 이라는 동일한 뼈대를 공유하고, 방향만 반대입니다.
+# 두 신호 모두 "최근 N개 캔들 구간 내 극값 갱신 + 반대 방향 마감 + 표준 망치형 비율 조건"
+# 이라는 동일한 뼈대를 공유하고, 방향만 반대입니다.
 #
 #  - 역망치 음봉(inverted_hammer_bearish):
-#      구간 신고가 + 음봉(종가<시가) + 윗꼬리 >= 몸통  → 상단에서 매도세 유입 신호
+#      구간 신고가 + 음봉(종가<시가) + 윗꼬리가 지배적인 표준 역망치 모양 → 상단에서 매도세 유입 신호
 #  - 망치 양봉(hammer_bullish):
-#      구간 신저가 + 양봉(종가>시가) + 아랫꼬리 >= 몸통 → 하단에서 매수세 유입 신호
+#      구간 신저가 + 양봉(종가>시가) + 아랫꼬리가 지배적인 표준 망치 모양 → 하단에서 매수세 유입 신호
+#
+# [모양 판정 기준 강화]
+# 예전에는 "꼬리 >= 몸통"만 봤는데, 이는 문턱이 너무 낮아 변동성만 있으면 쉽게 통과되어
+# 알람이 과도하게 많이 발생했습니다. 이제는 전체 캔들 레인지(고가-저가) 대비 비율로 판정합니다:
+#   - 몸통 <= 레인지의 SHAPE_BODY_RATIO_MAX (작은 몸통)
+#   - 주요 꼬리 >= 레인지의 SHAPE_MAIN_WICK_RATIO_MIN (긴 꼬리)
+#   - 반대쪽 꼬리 <= 레인지의 SHAPE_OPPOSITE_WICK_RATIO_MAX (반대쪽은 짧아야 함, 도지형 배제)
+
+
+def _is_valid_reversal_shape(o, h, l, c, main_wick, opposite_wick):
+    """레인지 대비 비율로 표준 망치/역망치 모양인지 판정"""
+    candle_range = h - l
+    if candle_range <= 0:
+        return False, 0.0, 0.0, 0.0
+
+    body = abs(c - o)
+    body_ratio = body / candle_range
+    main_wick_ratio = main_wick / candle_range
+    opposite_wick_ratio = opposite_wick / candle_range
+
+    ok = (
+        body_ratio <= SHAPE_BODY_RATIO_MAX
+        and main_wick_ratio >= SHAPE_MAIN_WICK_RATIO_MIN
+        and opposite_wick_ratio <= SHAPE_OPPOSITE_WICK_RATIO_MAX
+    )
+    return ok, body_ratio, main_wick_ratio, opposite_wick_ratio
 
 
 def check_inverted_hammer_bearish(candles, lookback: int):
@@ -139,19 +181,26 @@ def check_inverted_hammer_bearish(candles, lookback: int):
     is_directional = c < o  # 음봉
 
     body = abs(c - o)
-    wick = h - max(o, c)  # 윗꼬리
-    is_shape_ok = wick >= body
+    main_wick = h - max(o, c)     # 윗꼬리 (주요 꼬리)
+    opposite_wick = min(o, c) - l  # 아랫꼬리 (반대 꼬리)
 
-    ok = is_new_extreme and is_directional and is_shape_ok
+    shape_ok, body_ratio, main_wick_ratio, opposite_wick_ratio = _is_valid_reversal_shape(
+        o, h, l, c, main_wick, opposite_wick
+    )
+
+    ok = is_new_extreme and is_directional and shape_ok
     extreme_diff_pct = ((h - c) / h * 100) if h != 0 else 0.0
 
     detail = {
         "open": o, "high": h, "low": l, "close": c,
-        "body": body, "wick": wick, "wick_label": "윗꼬리",
+        "body": body, "wick": main_wick, "wick_label": "윗꼬리",
         "extreme_label": "신고가",
         "extreme_diff_pct": extreme_diff_pct,
         "extreme_diff_label": "고가 대비 종가 하락률",
-        "condition_label": "신고가 + 음봉 + 역망치형",
+        "condition_label": "신고가 + 음봉 + 역망치형(표준 비율)",
+        "body_ratio": body_ratio,
+        "main_wick_ratio": main_wick_ratio,
+        "opposite_wick_ratio": opposite_wick_ratio,
     }
     return ok, detail
 
@@ -168,19 +217,26 @@ def check_hammer_bullish(candles, lookback: int):
     is_directional = c > o  # 양봉
 
     body = abs(c - o)
-    wick = min(o, c) - l  # 아랫꼬리
-    is_shape_ok = wick >= body
+    main_wick = min(o, c) - l      # 아랫꼬리 (주요 꼬리)
+    opposite_wick = h - max(o, c)  # 윗꼬리 (반대 꼬리)
 
-    ok = is_new_extreme and is_directional and is_shape_ok
+    shape_ok, body_ratio, main_wick_ratio, opposite_wick_ratio = _is_valid_reversal_shape(
+        o, h, l, c, main_wick, opposite_wick
+    )
+
+    ok = is_new_extreme and is_directional and shape_ok
     extreme_diff_pct = ((c - l) / l * 100) if l != 0 else 0.0
 
     detail = {
         "open": o, "high": h, "low": l, "close": c,
-        "body": body, "wick": wick, "wick_label": "아랫꼬리",
+        "body": body, "wick": main_wick, "wick_label": "아랫꼬리",
         "extreme_label": "신저가",
         "extreme_diff_pct": extreme_diff_pct,
         "extreme_diff_label": "저가 대비 종가 상승률",
-        "condition_label": "신저가 + 양봉 + 망치형",
+        "condition_label": "신저가 + 양봉 + 망치형(표준 비율)",
+        "body_ratio": body_ratio,
+        "main_wick_ratio": main_wick_ratio,
+        "opposite_wick_ratio": opposite_wick_ratio,
     }
     return ok, detail
 
@@ -234,7 +290,8 @@ def check_symbol_timeframe(exchange, symbol, state, tf_conf, candles_cache):
                 f"고가: {detail['high']:.6g}\n"
                 f"저가: {detail['low']:.6g}\n"
                 f"종가: {detail['close']:.6g}\n"
-                f"몸통: {detail['body']:.6g} / {detail['wick_label']}: {detail['wick']:.6g}\n"
+                f"몸통: {detail['body']:.6g} ({detail['body_ratio']*100:.0f}%) / "
+                f"{detail['wick_label']}: {detail['wick']:.6g} ({detail['main_wick_ratio']*100:.0f}%)\n"
                 f"{detail['extreme_diff_label']}: {detail['extreme_diff_pct']:.2f}%\n"
                 f"조건: 최근 {lookback}개 [{timeframe}] 캔들 중 {detail['condition_label']}"
             )
