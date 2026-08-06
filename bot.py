@@ -275,6 +275,12 @@ def seconds_until_next_close():
 
 
 def run_once():
+    # 외부 스케줄러(cron-job.org)가 정각(0,15,30,45분)에 정확히 이 실행을
+    # 트리거하므로, 캔들이 거래소에 완전히 반영될 시간을 벌기 위해
+    # 여기서 CLOSE_BUFFER_SEC(12초)만큼 대기한 뒤 체크를 시작한다.
+    log.info("정각 트리거 감지 → %d초 대기 후 체크 시작", CLOSE_BUFFER_SEC)
+    time.sleep(CLOSE_BUFFER_SEC)
+
     exchange = build_exchange()
     symbols = resolve_symbols(exchange, RAW_SYMBOLS)
     if not symbols:
