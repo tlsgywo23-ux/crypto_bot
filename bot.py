@@ -2,13 +2,9 @@
 OKX 무기한 선물(perpetual swap) 캔들 신호 감시 봇
 - 타임프레임: 15분봉 / 1시간봉 / 4시간봉
 - 신호 패턴: 역망치형 음봉(고점 갱신 실패형 매도세) / 망치형 양봉(저점 갱신 후 매수세)
-
-[알람 빈도 완화 버전]
-- 캔들 모양 조건을 "꼬리 >= 몸통"(느슨함) → 표준 망치/역망치 비율 기준으로 강화
-  (레인지 대비 몸통 30% 이하, 주요 꼬리 60% 이상, 반대 꼬리 15% 이하)
-- lookback을 타임프레임별로 늘려서 너무 짧은 구간의 신고가/신저가에는 반응하지 않도록 함
-  (15m: 15→20 / 1h: 15→24 / 4h: 15→30)
-- 아래 SHAPE_* 상수를 조절해서 민감도를 더 세밀하게 튜닝할 수 있습니다.
+- 추가 필터: RSI 다이버전스
+    * 역망치 음봉: 신고가 갱신 + RSI는 이전 고점보다 낮음 (하락 다이버전스)
+    * 망치 양봉  : 신저가 갱신 + RSI는 이전 저점보다 높음 (상승 다이버전스)
 """
 
 import ccxt
@@ -25,25 +21,24 @@ import argparse
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "여기에_봇_토큰_입력")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "여기에_챗ID_입력")
 
-# 감시할 타임프레임 목록
-# lookback을 늘려서(타임프레임별로 의미있는 구간이 되도록) 너무 잦은 "신고가/신저가 갱신"을
-# 신호로 인정하지 않도록 함.
+# 감시할 타임프레임 목록 (lookback: 극값/다이버전스 판단에 사용하는 캔들 개수)
 TIMEFRAMES = [
-    {"tf": "15m", "ms": 15 * 60 * 1000, "lookback": 20},   # 약 5시간 구간
-    {"tf": "1h", "ms": 60 * 60 * 1000, "lookback": 24},    # 약 1일 구간
-    {"tf": "4h", "ms": 4 * 60 * 60 * 1000, "lookback": 30},  # 약 5일 구간
+    {"tf": "15m", "ms": 15 * 60 * 1000, "lookback": 30},
+    {"tf": "1h", "ms": 60 * 60 * 1000, "lookback": 30},
+    {"tf": "4h", "ms": 4 * 60 * 60 * 1000, "lookback": 30},
 ]
+
+# RSI 설정
+RSI_PERIOD = 14          # RSI 계산 기간 (표준 14)
+RSI_WARMUP_BARS = 100    # RSI 값이 안정화되도록 lookback 앞에 추가로 확보하는 캔들 수
+
+# 캔들 모양 설정
+# 반대쪽 꼬리(신호 방향이 아닌 쪽)는 캔들 전체 범위(고가-저가) 대비 이 비율 이내로 짧아야 함
+MAX_OPPOSITE_WICK_RATIO = 0.15
 
 # 루프 모드에서 깨어나는 주기(초). 가장 짧은 타임프레임(15m) 기준.
 TICK_INTERVAL_SEC = 15 * 60
 CLOSE_BUFFER_SEC = 12
-
-# --- 캔들 모양(망치/역망치) 판정 기준 ---
-# 전체 레인지(고가-저가) 대비 비율로 판정. 값을 낮추면(예: WICK_RATIO_MIN을 낮추면)
-# 신호가 더 자주 뜨고, 높이면 더 엄격해져서 알람이 줄어듭니다.
-SHAPE_BODY_RATIO_MAX = 0.30       # 몸통은 전체 레인지의 30% 이하여야 함
-SHAPE_MAIN_WICK_RATIO_MIN = 0.60  # 주요 꼬리는 전체 레인지의 60% 이상이어야 함
-SHAPE_OPPOSITE_WICK_RATIO_MAX = 0.15  # 반대쪽 꼬리는 전체 레인지의 15% 이하여야 함 (도지형 배제)
 
 STATE_FILE = os.environ.get("STATE_FILE", "alert_state.json")
 
@@ -132,111 +127,162 @@ def state_key(symbol: str, timeframe: str, signal_id: str) -> str:
     return f"{symbol}|{timeframe}|{signal_id}"
 
 
+# ============================== RSI ==============================
+
+
+def compute_rsi(closes, period: int = RSI_PERIOD):
+    """Wilder 방식 RSI. closes와 같은 길이의 리스트를 반환하며,
+    워밍업 구간(index < period)은 None으로 채워집니다.
+    rsi[i]는 closes[i] 시점의 RSI 값입니다."""
+    n = len(closes)
+    rsi = [None] * n
+    if n <= period:
+        return rsi
+
+    gains = []
+    losses = []
+    for i in range(1, period + 1):
+        change = closes[i] - closes[i - 1]
+        gains.append(max(change, 0.0))
+        losses.append(max(-change, 0.0))
+
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+    rsi[period] = 100.0 if avg_loss == 0 else 100 - (100 / (1 + avg_gain / avg_loss))
+
+    for i in range(period + 1, n):
+        change = closes[i] - closes[i - 1]
+        gain = max(change, 0.0)
+        loss = max(-change, 0.0)
+        avg_gain = (avg_gain * (period - 1) + gain) / period
+        avg_loss = (avg_loss * (period - 1) + loss) / period
+        rsi[i] = 100.0 if avg_loss == 0 else 100 - (100 / (1 + avg_gain / avg_loss))
+
+    return rsi
+
+
 # ============================== SIGNAL DEFINITIONS ==============================
 #
-# 두 신호 모두 "최근 N개 캔들 구간 내 극값 갱신 + 반대 방향 마감 + 표준 망치형 비율 조건"
-# 이라는 동일한 뼈대를 공유하고, 방향만 반대입니다.
+# 두 신호 모두 "직전 캔들들(현재 캔들 제외) 극값 대비 현재 캔들이 극값을 갱신 +
+# 반대 방향 마감 + 갱신 방향 꼬리가 몸통보다 크거나 같음 + RSI 다이버전스"라는
+# 동일한 뼈대를 공유하고, 방향만 반대입니다.
 #
 #  - 역망치 음봉(inverted_hammer_bearish):
-#      구간 신고가 + 음봉(종가<시가) + 윗꼬리가 지배적인 표준 역망치 모양 → 상단에서 매도세 유입 신호
+#      직전 구간 대비 신고가 + 음봉(종가<시가) + 윗꼬리 >= 몸통
+#      + RSI 하락 다이버전스(현재 RSI < 직전 고점 캔들의 RSI) → 상단에서 매도세 유입 신호
 #  - 망치 양봉(hammer_bullish):
-#      구간 신저가 + 양봉(종가>시가) + 아랫꼬리가 지배적인 표준 망치 모양 → 하단에서 매수세 유입 신호
-#
-# [모양 판정 기준 강화]
-# 예전에는 "꼬리 >= 몸통"만 봤는데, 이는 문턱이 너무 낮아 변동성만 있으면 쉽게 통과되어
-# 알람이 과도하게 많이 발생했습니다. 이제는 전체 캔들 레인지(고가-저가) 대비 비율로 판정합니다:
-#   - 몸통 <= 레인지의 SHAPE_BODY_RATIO_MAX (작은 몸통)
-#   - 주요 꼬리 >= 레인지의 SHAPE_MAIN_WICK_RATIO_MIN (긴 꼬리)
-#   - 반대쪽 꼬리 <= 레인지의 SHAPE_OPPOSITE_WICK_RATIO_MAX (반대쪽은 짧아야 함, 도지형 배제)
+#      직전 구간 대비 신저가 + 양봉(종가>시가) + 아랫꼬리 >= 몸통
+#      + RSI 상승 다이버전스(현재 RSI > 직전 저점 캔들의 RSI) → 하단에서 매수세 유입 신호
 
 
-def _is_valid_reversal_shape(o, h, l, c, main_wick, opposite_wick):
-    """레인지 대비 비율로 표준 망치/역망치 모양인지 판정"""
-    candle_range = h - l
-    if candle_range <= 0:
-        return False, 0.0, 0.0, 0.0
-
-    body = abs(c - o)
-    body_ratio = body / candle_range
-    main_wick_ratio = main_wick / candle_range
-    opposite_wick_ratio = opposite_wick / candle_range
-
-    ok = (
-        body_ratio <= SHAPE_BODY_RATIO_MAX
-        and main_wick_ratio >= SHAPE_MAIN_WICK_RATIO_MIN
-        and opposite_wick_ratio <= SHAPE_OPPOSITE_WICK_RATIO_MAX
-    )
-    return ok, body_ratio, main_wick_ratio, opposite_wick_ratio
-
-
-def check_inverted_hammer_bearish(candles, lookback: int):
-    if len(candles) < lookback:
+def check_inverted_hammer_bearish(candles, rsi_series, lookback: int):
+    if len(candles) < lookback or len(rsi_series) < lookback:
         return False, None
 
     window = candles[-lookback:]
-    _, o, h, l, c, v = window[-1]
+    rsi_window = rsi_series[-lookback:]
+    if any(r is None for r in rsi_window):
+        return False, None  # RSI 워밍업 미완료
 
-    max_high = max(cd[2] for cd in window)
-    is_new_extreme = h >= max_high
+    prior_window = window[:-1]
+    prior_rsi = rsi_window[:-1]
+    if not prior_window:
+        return False, None
+
+    _, o, h, l, c, v = window[-1]
+    cur_rsi = rsi_window[-1]
+
+    prior_max_high = max(cd[2] for cd in prior_window)
+    is_new_extreme = h > prior_max_high  # 직전 구간 대비 신고가
+
     is_directional = c < o  # 음봉
 
     body = abs(c - o)
-    main_wick = h - max(o, c)     # 윗꼬리 (주요 꼬리)
-    opposite_wick = min(o, c) - l  # 아랫꼬리 (반대 꼬리)
+    wick = h - max(o, c)  # 윗꼬리 (신호 방향 꼬리)
+    opposite_wick = min(o, c) - l  # 밑꼬리 (반대쪽 꼬리)
+    candle_range = h - l
 
-    shape_ok, body_ratio, main_wick_ratio, opposite_wick_ratio = _is_valid_reversal_shape(
-        o, h, l, c, main_wick, opposite_wick
-    )
+    is_wick_ok = wick >= body  # 윗꼬리는 몸통보다 크거나 같아야 함
+    is_opposite_wick_ok = opposite_wick <= candle_range * MAX_OPPOSITE_WICK_RATIO  # 밑꼬리는 없거나 매우 짧아야 함
+    is_shape_ok = is_wick_ok and is_opposite_wick_ok
 
-    ok = is_new_extreme and is_directional and shape_ok
+    # 직전 구간에서 고점을 찍었던 캔들의 RSI
+    peak_idx = max(range(len(prior_window)), key=lambda i: prior_window[i][2])
+    prior_peak_rsi = prior_rsi[peak_idx]
+    prior_peak_high = prior_window[peak_idx][2]
+    is_bearish_divergence = cur_rsi < prior_peak_rsi
+
+    ok = is_new_extreme and is_directional and is_shape_ok and is_bearish_divergence
     extreme_diff_pct = ((h - c) / h * 100) if h != 0 else 0.0
 
     detail = {
         "open": o, "high": h, "low": l, "close": c,
-        "body": body, "wick": main_wick, "wick_label": "윗꼬리",
+        "body": body, "wick": wick, "wick_label": "윗꼬리",
+        "opposite_wick": opposite_wick, "opposite_wick_label": "밑꼬리",
         "extreme_label": "신고가",
         "extreme_diff_pct": extreme_diff_pct,
         "extreme_diff_label": "고가 대비 종가 하락률",
-        "condition_label": "신고가 + 음봉 + 역망치형(표준 비율)",
-        "body_ratio": body_ratio,
-        "main_wick_ratio": main_wick_ratio,
-        "opposite_wick_ratio": opposite_wick_ratio,
+        "condition_label": "신고가 갱신 + 음봉 + 윗꼬리≥몸통 + 밑꼬리 짧음 + RSI 하락다이버전스",
+        "cur_rsi": cur_rsi,
+        "ref_rsi": prior_peak_rsi,
+        "ref_price": prior_peak_high,
+        "ref_label": "직전 고점",
     }
     return ok, detail
 
 
-def check_hammer_bullish(candles, lookback: int):
-    if len(candles) < lookback:
+def check_hammer_bullish(candles, rsi_series, lookback: int):
+    if len(candles) < lookback or len(rsi_series) < lookback:
         return False, None
 
     window = candles[-lookback:]
-    _, o, h, l, c, v = window[-1]
+    rsi_window = rsi_series[-lookback:]
+    if any(r is None for r in rsi_window):
+        return False, None  # RSI 워밍업 미완료
 
-    min_low = min(cd[3] for cd in window)
-    is_new_extreme = l <= min_low
+    prior_window = window[:-1]
+    prior_rsi = rsi_window[:-1]
+    if not prior_window:
+        return False, None
+
+    _, o, h, l, c, v = window[-1]
+    cur_rsi = rsi_window[-1]
+
+    prior_min_low = min(cd[3] for cd in prior_window)
+    is_new_extreme = l < prior_min_low  # 직전 구간 대비 신저가
+
     is_directional = c > o  # 양봉
 
     body = abs(c - o)
-    main_wick = min(o, c) - l      # 아랫꼬리 (주요 꼬리)
-    opposite_wick = h - max(o, c)  # 윗꼬리 (반대 꼬리)
+    wick = min(o, c) - l  # 아랫꼬리 (신호 방향 꼬리)
+    opposite_wick = h - max(o, c)  # 윗꼬리 (반대쪽 꼬리)
+    candle_range = h - l
 
-    shape_ok, body_ratio, main_wick_ratio, opposite_wick_ratio = _is_valid_reversal_shape(
-        o, h, l, c, main_wick, opposite_wick
-    )
+    is_wick_ok = wick >= body  # 아랫꼬리는 몸통보다 크거나 같아야 함
+    is_opposite_wick_ok = opposite_wick <= candle_range * MAX_OPPOSITE_WICK_RATIO  # 윗꼬리는 없거나 매우 짧아야 함
+    is_shape_ok = is_wick_ok and is_opposite_wick_ok
 
-    ok = is_new_extreme and is_directional and shape_ok
+    # 직전 구간에서 저점을 찍었던 캔들의 RSI
+    trough_idx = min(range(len(prior_window)), key=lambda i: prior_window[i][3])
+    prior_trough_rsi = prior_rsi[trough_idx]
+    prior_trough_low = prior_window[trough_idx][3]
+    is_bullish_divergence = cur_rsi > prior_trough_rsi
+
+    ok = is_new_extreme and is_directional and is_shape_ok and is_bullish_divergence
     extreme_diff_pct = ((c - l) / l * 100) if l != 0 else 0.0
 
     detail = {
         "open": o, "high": h, "low": l, "close": c,
-        "body": body, "wick": main_wick, "wick_label": "아랫꼬리",
+        "body": body, "wick": wick, "wick_label": "아랫꼬리",
+        "opposite_wick": opposite_wick, "opposite_wick_label": "윗꼬리",
         "extreme_label": "신저가",
         "extreme_diff_pct": extreme_diff_pct,
         "extreme_diff_label": "저가 대비 종가 상승률",
-        "condition_label": "신저가 + 양봉 + 망치형(표준 비율)",
-        "body_ratio": body_ratio,
-        "main_wick_ratio": main_wick_ratio,
-        "opposite_wick_ratio": opposite_wick_ratio,
+        "condition_label": "신저가 갱신 + 양봉 + 아랫꼬리≥몸통 + 윗꼬리 짧음 + RSI 상승다이버전스",
+        "cur_rsi": cur_rsi,
+        "ref_rsi": prior_trough_rsi,
+        "ref_price": prior_trough_low,
+        "ref_label": "직전 저점",
     }
     return ok, detail
 
@@ -257,17 +303,22 @@ def fetch_closed_candles(exchange: ccxt.okx, symbol: str, timeframe: str, timefr
 
 
 def check_symbol_timeframe(exchange, symbol, state, tf_conf, candles_cache):
-    """한 심볼 x 한 타임프레임에 대해 캔들을 가져와서 등록된 모든 신호를 체크"""
+    """한 심볼 x 한 타임프레임에 대해 캔들/RSI를 가져와서 등록된 모든 신호를 체크"""
     timeframe = tf_conf["tf"]
     timeframe_ms = tf_conf["ms"]
     lookback = tf_conf["lookback"]
 
+    # RSI가 lookback 구간 내내 안정된 값을 갖도록 앞쪽에 워밍업 구간을 더 받아온다.
+    fetch_count = lookback + RSI_PERIOD + RSI_WARMUP_BARS
+
     cache_key = (symbol, timeframe)
     if cache_key not in candles_cache:
-        candles_cache[cache_key] = fetch_closed_candles(
-            exchange, symbol, timeframe, timeframe_ms, lookback
-        )
-    candles = candles_cache[cache_key]
+        candles = fetch_closed_candles(exchange, symbol, timeframe, timeframe_ms, fetch_count)
+        closes = [cd[4] for cd in candles]
+        rsi_series = compute_rsi(closes, RSI_PERIOD)
+        candles_cache[cache_key] = (candles, rsi_series)
+
+    candles, rsi_series = candles_cache[cache_key]
     if not candles:
         return
 
@@ -281,7 +332,7 @@ def check_symbol_timeframe(exchange, symbol, state, tf_conf, candles_cache):
         if state.get(key) == latest_candle_ts:
             continue
 
-        ok, detail = sig["fn"](candles, lookback)
+        ok, detail = sig["fn"](candles, rsi_series, lookback)
         if ok:
             msg = (
                 f"{sig['emoji']} <b>{symbol}</b> [{timeframe}] {sig['name']} 신호 발생\n"
@@ -290,9 +341,9 @@ def check_symbol_timeframe(exchange, symbol, state, tf_conf, candles_cache):
                 f"고가: {detail['high']:.6g}\n"
                 f"저가: {detail['low']:.6g}\n"
                 f"종가: {detail['close']:.6g}\n"
-                f"몸통: {detail['body']:.6g} ({detail['body_ratio']*100:.0f}%) / "
-                f"{detail['wick_label']}: {detail['wick']:.6g} ({detail['main_wick_ratio']*100:.0f}%)\n"
+                f"몸통: {detail['body']:.6g} / {detail['wick_label']}: {detail['wick']:.6g} / {detail['opposite_wick_label']}: {detail['opposite_wick']:.6g}\n"
                 f"{detail['extreme_diff_label']}: {detail['extreme_diff_pct']:.2f}%\n"
+                f"RSI(현재): {detail['cur_rsi']:.2f} / RSI({detail['ref_label']}, {detail['ref_price']:.6g}): {detail['ref_rsi']:.2f}\n"
                 f"조건: 최근 {lookback}개 [{timeframe}] 캔들 중 {detail['condition_label']}"
             )
             log.info("신호 발생: %s [%s] %s", symbol, timeframe, sig["name"])
@@ -380,7 +431,7 @@ def run_loop():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="OKX 캔들 신호 감시 봇 (15m/1h/4h, 역망치음봉/망치양봉)")
+    parser = argparse.ArgumentParser(description="OKX 캔들 신호 감시 봇 (15m/1h/4h, 역망치음봉/망치양봉 + RSI 다이버전스)")
     parser.add_argument("--once", action="store_true", help="1회만 체크하고 종료")
     args = parser.parse_args()
 
