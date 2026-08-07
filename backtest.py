@@ -228,12 +228,37 @@ def build_summary(df: pd.DataFrame) -> str:
 # ============================== MAIN ==============================
 
 
+def build_breakdown(df: pd.DataFrame) -> pd.DataFrame:
+    """종목 x 타임프레임 x 신호유형 조합별로 승률/평균 수익률을 집계한 표"""
+    if df.empty:
+        return pd.DataFrame(columns=["종목", "순번", "타임프레임", "신호", "신호건수", "승률(%)", "평균수익률(%)"])
+
+    rows = []
+    for (symbol, rank, tf, sig), g in df.groupby(["종목", "순번", "타임프레임", "신호"]):
+        rows.append({
+            "종목": symbol,
+            "순번": rank,
+            "타임프레임": tf,
+            "신호": sig,
+            "신호건수": len(g),
+            "승률(%)": round((g["성공여부"] == "성공").mean() * 100, 1),
+            "평균수익률(%)": round(g["수익률(%)"].mean(), 2),
+        })
+
+    breakdown = pd.DataFrame(rows)
+    # 신호건수 많은 순 -> 승률 높은 순으로 정렬해서 보기 편하게
+    return breakdown.sort_values(by=["신호건수", "승률(%)"], ascending=[False, False]).reset_index(drop=True)
+
+
 def main():
     log.info("백테스트 시작 (최근 %d개월, 신호 후 %d개 캔들 추적)", BACKTEST_MONTHS, FOLLOW_CANDLES)
     df = run_backtest()
 
-    df.to_excel(OUTPUT_XLSX, index=False)
-    log.info("엑셀 저장 완료: %s (%d행)", OUTPUT_XLSX, len(df))
+    breakdown_df = build_breakdown(df)
+    with pd.ExcelWriter(OUTPUT_XLSX, engine="openpyxl") as writer:
+        breakdown_df.to_excel(writer, sheet_name="종목별_요약", index=False)
+        df.to_excel(writer, sheet_name="상세내역", index=False)
+    log.info("엑셀 저장 완료: %s (상세 %d행, 요약 %d행)", OUTPUT_XLSX, len(df), len(breakdown_df))
 
     summary = build_summary(df)
     log.info("텔레그램으로 요약 + 엑셀 파일 전송")
