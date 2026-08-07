@@ -40,6 +40,9 @@ MAX_OPPOSITE_WICK_RATIO = 0.15
 TICK_INTERVAL_SEC = 15 * 60
 CLOSE_BUFFER_SEC = 12
 
+# 캔들 마감시각을 텔레그램 메시지에 표시할 때 쓰는 타임존 (한국시간)
+KST = datetime.timezone(datetime.timedelta(hours=9))
+
 STATE_FILE = os.environ.get("STATE_FILE", "alert_state.json")
 
 RAW_SYMBOLS = [
@@ -48,6 +51,9 @@ RAW_SYMBOLS = [
     "BSB", "HOME", "SAHARA", "HMSTR", "TRUMP", "EDGE", "PEPE", "XPL", "SPACE",
     "COAI", "RE", "ADA", "O", "BASED", "HYPE", "SLX", "NES", "CAP", "LIT", "BNB",
 ]
+
+# 심볼 이름 -> RAW_SYMBOLS 안에서의 순번(1부터 시작) 조회용
+SYMBOL_RANK = {sym: idx + 1 for idx, sym in enumerate(RAW_SYMBOLS)}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -323,9 +329,15 @@ def check_symbol_timeframe(exchange, symbol, state, tf_conf, candles_cache):
         return
 
     latest_candle_ts = candles[-1][0]
+    # 캔들 마감시각은 한국시간(KST)으로 표시
     candle_time = datetime.datetime.fromtimestamp(
-        latest_candle_ts / 1000, tz=datetime.timezone.utc
-    ).strftime("%Y-%m-%d %H:%M UTC")
+        latest_candle_ts / 1000, tz=KST
+    ).strftime("%Y-%m-%d %H:%M KST")
+
+    # 심볼 순번 (RAW_SYMBOLS 안에서 몇 번째로 감시하는 종목인지)
+    raw_symbol = symbol.split("/")[0]
+    rank = SYMBOL_RANK.get(raw_symbol)
+    rank_label = f"{rank}번째" if rank else "?번째"
 
     for sig in SIGNALS:
         key = state_key(symbol, timeframe, sig["id"])
@@ -335,16 +347,14 @@ def check_symbol_timeframe(exchange, symbol, state, tf_conf, candles_cache):
         ok, detail = sig["fn"](candles, rsi_series, lookback)
         if ok:
             msg = (
-                f"{sig['emoji']} <b>{symbol}</b> [{timeframe}] {sig['name']} 신호 발생\n"
+                f"{sig['emoji']} <b>{raw_symbol}</b> [{timeframe}] {sig['name']} 신호 발생\n"
+                f"({rank_label} 종목)\n"
                 f"캔들 마감시각: {candle_time}\n"
-                f"시가: {detail['open']:.6g}\n"
-                f"고가: {detail['high']:.6g}\n"
-                f"저가: {detail['low']:.6g}\n"
-                f"종가: {detail['close']:.6g}\n"
-                f"몸통: {detail['body']:.6g} / {detail['wick_label']}: {detail['wick']:.6g} / {detail['opposite_wick_label']}: {detail['opposite_wick']:.6g}\n"
+                f"{detail['wick_label']}: {detail['wick']:.6g} / {detail['opposite_wick_label']}: {detail['opposite_wick']:.6g}\n"
                 f"{detail['extreme_diff_label']}: {detail['extreme_diff_pct']:.2f}%\n"
                 f"RSI(현재): {detail['cur_rsi']:.2f} / RSI({detail['ref_label']}, {detail['ref_price']:.6g}): {detail['ref_rsi']:.2f}\n"
-                f"조건: 최근 {lookback}개 [{timeframe}] 캔들 중 {detail['condition_label']}"
+                f"조건: 최근 {lookback}개 [{timeframe}] 캔들 중 {detail['condition_label']}\n\n"
+                f"하성하리아빠 화이팅입니다! 꼭 부자되시고 힘내세요!"
             )
             log.info("신호 발생: %s [%s] %s", symbol, timeframe, sig["name"])
             send_telegram(msg)
