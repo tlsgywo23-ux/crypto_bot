@@ -3,9 +3,15 @@ OKX 캔들 신호 백테스트 스크립트
 - bot.py에 있는 신호 판단 로직(check_inverted_hammer_bearish, check_hammer_bullish)을
   그대로 가져와서 씁니다. 로직을 따로 베끼지 않기 때문에, bot.py의 조건을 바꾸면
   백테스트에도 자동으로 반영됩니다.
-- 최근 BACKTEST_MONTHS 개월치 15m/1h/4h 캔들에서 신호가 발생했던 모든 지점을 찾고,
+- 최근 BACKTEST_MONTHS 개월치 캔들에서 신호가 발생했던 모든 지점을 찾고,
   신호 발생 이후 FOLLOW_CANDLES개 캔들 동안의 가격 움직임으로 성공/실패를 판정합니다.
 - 결과는 엑셀 파일(backtest_result.xlsx)로 저장하고, 요약은 텔레그램으로도 전송합니다.
+
+[타임프레임 관련]
+- 감시할 타임프레임(TIMEFRAMES)은 실전 봇(bot.py)이 쓰는 값이라 여기서는 가져오지
+  않습니다. 대신 아래 BACKTEST_TIMEFRAMES를 따로 두고 백테스트는 이걸 사용합니다.
+  → 백테스트에서 12h/1d처럼 실전에는 안 쓰는 타임프레임의 승률만 확인해보고
+  싶을 때, bot.py(실전 봇)는 전혀 건드리지 않고 이 파일에서만 추가/제거하면 됩니다.
 """
 
 import datetime
@@ -17,7 +23,7 @@ import requests
 
 from bot import (
     build_exchange, resolve_symbols, RAW_SYMBOLS, SYMBOL_RANK,
-    TIMEFRAMES, RSI_PERIOD, RSI_WARMUP_BARS,
+    RSI_PERIOD, RSI_WARMUP_BARS,
     compute_rsi, SIGNALS, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, KST,
 )
 
@@ -26,6 +32,17 @@ from bot import (
 BACKTEST_MONTHS = 6      # 몇 개월치 과거 데이터를 볼지
 FOLLOW_CANDLES = 5        # 신호 발생 이후 몇 개 캔들까지의 움직임으로 성공/실패 판정할지
 OUTPUT_XLSX = "backtest_result.xlsx"
+
+# 백테스트에서 확인해볼 타임프레임 목록.
+# 실전 봇(bot.py)의 TIMEFRAMES와 별개로 관리되므로, 여기서 12h/1d를
+# 추가하거나 빼도 실전 감시 대상에는 영향이 없습니다.
+BACKTEST_TIMEFRAMES = [
+    {"tf": "15m", "ms": 15 * 60 * 1000, "lookback": 30},
+    {"tf": "1h", "ms": 60 * 60 * 1000, "lookback": 30},
+    {"tf": "4h", "ms": 4 * 60 * 60 * 1000, "lookback": 30},
+    {"tf": "12h", "ms": 12 * 60 * 60 * 1000, "lookback": 30},
+    {"tf": "1d", "ms": 24 * 60 * 60 * 1000, "lookback": 30},
+]
 
 log = logging.getLogger("backtest")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -130,7 +147,7 @@ def run_backtest() -> pd.DataFrame:
         raw_symbol = symbol.split("/")[0]
         rank = SYMBOL_RANK.get(raw_symbol)
 
-        for tf_conf in TIMEFRAMES:
+        for tf_conf in BACKTEST_TIMEFRAMES:
             timeframe = tf_conf["tf"]
             timeframe_ms = tf_conf["ms"]
             lookback = tf_conf["lookback"]
