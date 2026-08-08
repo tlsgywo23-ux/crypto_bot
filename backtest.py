@@ -4,7 +4,9 @@ OKX 캔들 신호 백테스트 스크립트
   그대로 가져와서 씁니다. 로직을 따로 베끼지 않기 때문에, bot.py의 조건을 바꾸면
   백테스트에도 자동으로 반영됩니다.
 - 최근 BACKTEST_MONTHS 개월치 캔들에서 신호가 발생했던 모든 지점을 찾고,
-  신호 발생 이후 FOLLOW_CANDLES개 캔들 동안의 가격 움직임으로 성공/실패를 판정합니다.
+  신호 발생 이후 FOLLOW_CANDLES_LIST에 있는 각 추적 기간(예: 5봉, 10봉) 동안의
+  가격 움직임으로 성공/실패를 판정합니다. 같은 신호 하나당 추적 기간별로
+  결과 행이 하나씩 생기고, "추적봉수" 컬럼으로 구분됩니다.
 - 결과는 엑셀 파일(backtest_result.xlsx)로 저장하고, 요약은 텔레그램으로도 전송합니다.
 
 [타임프레임 관련]
@@ -12,6 +14,11 @@ OKX 캔들 신호 백테스트 스크립트
   않습니다. 대신 아래 BACKTEST_TIMEFRAMES를 따로 두고 백테스트는 이걸 사용합니다.
   → 백테스트에서 12h/1d처럼 실전에는 안 쓰는 타임프레임의 승률만 확인해보고
   싶을 때, bot.py(실전 봇)는 전혀 건드리지 않고 이 파일에서만 추가/제거하면 됩니다.
+
+[수익률(%) 컬럼 관련]
+- "수익률(%)"은 진입 방향(롱/숏) 기준으로 계산됩니다. 신호가 기대한 방향으로
+  가격이 움직였으면 +, 반대 방향으로 움직였으면 - 입니다.
+  (역망치 음봉=숏 기대: 가격 하락 시 +, 망치 양봉=롱 기대: 가격 상승 시 +)
 """
 
 import datetime
@@ -30,7 +37,11 @@ from bot import (
 # ============================== CONFIG ==============================
 
 BACKTEST_MONTHS = 6      # 몇 개월치 과거 데이터를 볼지
-FOLLOW_CANDLES = 5        # 신호 발생 이후 몇 개 캔들까지의 움직임으로 성공/실패 판정할지
+
+# 신호 발생 이후 몇 개 캔들까지의 움직임으로 성공/실패를 판정할지.
+# 여러 개를 넣으면 각각에 대한 결과를 한 번의 백테스트로 같이 뽑습니다.
+FOLLOW_CANDLES_LIST = [5, 10]
+
 OUTPUT_XLSX = "backtest_result.xlsx"
 
 # 백테스트에서 확인해볼 타임프레임 목록.
@@ -108,7 +119,10 @@ def fetch_full_history(exchange, symbol, timeframe, timeframe_ms, months):
 
 def evaluate_outcome(candles, signal_idx, direction, follow_n):
     """signal_idx 캔들의 종가를 진입가로 보고, 이후 follow_n개 캔들 동안의 결과를 계산.
-    데이터가 아직 부족(최근 신호라 미래 캔들이 안 쌓임)하면 None을 반환."""
+    데이터가 아직 부족(최근 신호라 미래 캔들이 안 쌓임)하면 None을 반환.
+
+    수익률(pnl_pct)은 진입 방향 기준입니다: 신호가 기대한 방향대로 가격이
+    움직였으면 +, 반대로 움직였으면 - 입니다."""
     entry_price = candles[signal_idx][4]
     future = candles[signal_idx + 1: signal_idx + 1 + follow_n]
     if len(future) < follow_n:
@@ -141,6 +155,7 @@ def evaluate_outcome(candles, signal_idx, direction, follow_n):
 def run_backtest() -> pd.DataFrame:
     exchange = build_exchange()
     symbols = resolve_symbols(exchange, RAW_SYMBOLS)
+    max_follow = max(FOLLOW_CANDLES_LIST)
 
     rows = []
     for symbol in symbols:
@@ -163,7 +178,9 @@ def run_backtest() -> pd.DataFrame:
             rsi_series = compute_rsi(closes, RSI_PERIOD)
 
             min_needed = lookback + RSI_PERIOD + RSI_WARMUP_BARS
-            for i in range(min_needed, len(candles) - FOLLOW_CANDLES):
+            # 가장 긴 추적 기간(max_follow) 기준으로 범위를 잡아서, 5봉/10봉
+            # 결과가 항상 "같은 신호 집합"에 대해 나오도록 함 (비교 공정성)
+            for i in range(min_needed, len(candles) - max_follow):
                 window = candles[i - lookback + 1: i + 1]
                 rsi_window = rsi_series[i - lookback + 1: i + 1]
 
@@ -173,24 +190,28 @@ def run_backtest() -> pd.DataFrame:
                         continue
 
                     direction = "short" if sig["id"] == "inv_hammer_bear" else "long"
-                    outcome = evaluate_outcome(candles, i, direction, FOLLOW_CANDLES)
-                    if outcome is None:
-                        continue
+                    candle_time_str = datetime.datetime.fromtimestamp(
+                        candles[i][0] / 1000, tz=KST
+                    ).strftime("%Y-%m-%d %H:%M")
 
-                    rows.append({
-                        "종목": raw_symbol,
-                        "순번": rank,
-                        "타임프레임": timeframe,
-                        "신호": sig["name"],
-                        "마감시각(KST)": datetime.datetime.fromtimestamp(
-                            candles[i][0] / 1000, tz=KST
-                        ).strftime("%Y-%m-%d %H:%M"),
-                        "진입가": candles[i][4],
-                        "수익률(%)": round(outcome["pnl_pct"], 2),
-                        "최대유리(%)": round(outcome["best_pct"], 2),
-                        "최대불리(%)": round(outcome["worst_pct"], 2),
-                        "성공여부": "성공" if outcome["success"] else "실패",
-                    })
+                    for follow_n in FOLLOW_CANDLES_LIST:
+                        outcome = evaluate_outcome(candles, i, direction, follow_n)
+                        if outcome is None:
+                            continue
+
+                        rows.append({
+                            "종목": raw_symbol,
+                            "순번": rank,
+                            "타임프레임": timeframe,
+                            "신호": sig["name"],
+                            "추적봉수": follow_n,
+                            "마감시각(KST)": candle_time_str,
+                            "진입가": candles[i][4],
+                            "수익률(%)": round(outcome["pnl_pct"], 2),
+                            "최대유리(%)": round(outcome["best_pct"], 2),
+                            "최대불리(%)": round(outcome["worst_pct"], 2),
+                            "성공여부": "성공" if outcome["success"] else "실패",
+                        })
 
             log.info("[%s|%s] 누적 신호 %d건", raw_symbol, timeframe, len(rows))
 
@@ -204,38 +225,38 @@ def build_summary(df: pd.DataFrame) -> str:
     if df.empty:
         return f"📊 백테스트 결과: 지난 {BACKTEST_MONTHS}개월 동안 조건을 만족한 신호가 하나도 없었습니다."
 
-    total = len(df)
-    win_rate = (df["성공여부"] == "성공").mean() * 100
-    avg_pnl = df["수익률(%)"].mean()
-
     lines = [
         f"📊 백테스트 결과 요약",
-        f"(최근 {BACKTEST_MONTHS}개월, 신호 후 {FOLLOW_CANDLES}개 캔들 기준)",
-        "",
-        f"전체 신호 수: {total}건",
-        f"전체 승률: {win_rate:.1f}%",
-        f"전체 평균 수익률: {avg_pnl:.2f}%",
-        "",
-        "── 타임프레임별 ──",
+        f"(최근 {BACKTEST_MONTHS}개월, 수익률은 진입방향 기준 +/-)",
     ]
-    for tf, g in df.groupby("타임프레임"):
-        lines.append(
-            f"[{tf}] {len(g)}건 / 승률 {(g['성공여부']=='성공').mean()*100:.1f}% / 평균 {g['수익률(%)'].mean():.2f}%"
-        )
 
-    lines.append("")
-    lines.append("── 신호 유형별 ──")
-    for sig, g in df.groupby("신호"):
-        lines.append(
-            f"{sig}: {len(g)}건 / 승률 {(g['성공여부']=='성공').mean()*100:.1f}% / 평균 {g['수익률(%)'].mean():.2f}%"
-        )
+    for follow_n in FOLLOW_CANDLES_LIST:
+        sub = df[df["추적봉수"] == follow_n]
+        lines.append("")
+        lines.append(f"════ {follow_n}봉 추적 기준 ════")
+        if sub.empty:
+            lines.append("해당 없음")
+            continue
 
-    lines.append("")
-    lines.append("── 신호 많은 상위 5개 종목 ──")
-    top_symbols = df.groupby("종목").size().sort_values(ascending=False).head(5)
-    for sym, cnt in top_symbols.items():
-        g = df[df["종목"] == sym]
-        lines.append(f"{sym}: {cnt}건 / 승률 {(g['성공여부']=='성공').mean()*100:.1f}%")
+        total = len(sub)
+        win_rate = (sub["성공여부"] == "성공").mean() * 100
+        avg_pnl = sub["수익률(%)"].mean()
+
+        lines.append(f"전체 신호 수: {total}건")
+        lines.append(f"전체 승률: {win_rate:.1f}%")
+        lines.append(f"전체 평균 수익률: {avg_pnl:.2f}%")
+
+        lines.append("── 타임프레임별 ──")
+        for tf, g in sub.groupby("타임프레임"):
+            lines.append(
+                f"[{tf}] {len(g)}건 / 승률 {(g['성공여부']=='성공').mean()*100:.1f}% / 평균 {g['수익률(%)'].mean():.2f}%"
+            )
+
+        lines.append("── 신호 유형별 ──")
+        for sig, g in sub.groupby("신호"):
+            lines.append(
+                f"{sig}: {len(g)}건 / 승률 {(g['성공여부']=='성공').mean()*100:.1f}% / 평균 {g['수익률(%)'].mean():.2f}%"
+            )
 
     lines.append("")
     lines.append("(종목·시각별 상세 내역은 첨부된 엑셀 파일 참고)")
@@ -246,29 +267,35 @@ def build_summary(df: pd.DataFrame) -> str:
 
 
 def build_breakdown(df: pd.DataFrame) -> pd.DataFrame:
-    """종목 x 타임프레임 x 신호유형 조합별로 승률/평균 수익률을 집계한 표"""
+    """종목 x 타임프레임 x 신호유형 x 추적봉수 조합별로 승률/평균 수익률을 집계한 표"""
     if df.empty:
-        return pd.DataFrame(columns=["종목", "순번", "타임프레임", "신호", "신호건수", "승률(%)", "평균수익률(%)"])
+        return pd.DataFrame(columns=[
+            "종목", "순번", "타임프레임", "신호", "추적봉수",
+            "신호건수", "승률(%)", "평균수익률(%)",
+        ])
 
     rows = []
-    for (symbol, rank, tf, sig), g in df.groupby(["종목", "순번", "타임프레임", "신호"]):
+    for (symbol, rank, tf, sig, follow_n), g in df.groupby(["종목", "순번", "타임프레임", "신호", "추적봉수"]):
         rows.append({
             "종목": symbol,
             "순번": rank,
             "타임프레임": tf,
             "신호": sig,
+            "추적봉수": follow_n,
             "신호건수": len(g),
             "승률(%)": round((g["성공여부"] == "성공").mean() * 100, 1),
             "평균수익률(%)": round(g["수익률(%)"].mean(), 2),
         })
 
     breakdown = pd.DataFrame(rows)
-    # 신호건수 많은 순 -> 승률 높은 순으로 정렬해서 보기 편하게
-    return breakdown.sort_values(by=["신호건수", "승률(%)"], ascending=[False, False]).reset_index(drop=True)
+    # 추적봉수 -> 신호건수 많은 순 -> 승률 높은 순으로 정렬해서 보기 편하게
+    return breakdown.sort_values(
+        by=["추적봉수", "신호건수", "승률(%)"], ascending=[True, False, False]
+    ).reset_index(drop=True)
 
 
 def main():
-    log.info("백테스트 시작 (최근 %d개월, 신호 후 %d개 캔들 추적)", BACKTEST_MONTHS, FOLLOW_CANDLES)
+    log.info("백테스트 시작 (최근 %d개월, 추적봉수: %s)", BACKTEST_MONTHS, FOLLOW_CANDLES_LIST)
     df = run_backtest()
 
     breakdown_df = build_breakdown(df)
