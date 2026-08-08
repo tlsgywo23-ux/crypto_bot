@@ -2,9 +2,19 @@
 OKX 무기한 선물(perpetual swap) 캔들 신호 감시 봇
 - 타임프레임: 15분봉 / 1시간봉 / 4시간봉
 - 신호 패턴: 역망치형 음봉(고점 갱신 실패형 매도세) / 망치형 양봉(저점 갱신 후 매수세)
-- 추가 필터: RSI 다이버전스
-    * 역망치 음봉: 신고가 갱신 + RSI는 이전 고점보다 낮음 (하락 다이버전스)
-    * 망치 양봉  : 신저가 갱신 + RSI는 이전 저점보다 높음 (상승 다이버전스)
+- 추가 필터: RSI 다이버전스 (진짜 스윙 피벗 기준 + 최소 갭)
+    * 역망치 음봉: 신고가 갱신 + RSI는 "최소 MIN_PIVOT_DISTANCE개 이전의 스윙 고점"보다 낮음
+    * 망치 양봉  : 신저가 갱신 + RSI는 "최소 MIN_PIVOT_DISTANCE개 이전의 스윙 저점"보다 높음
+
+[2026-08 수정사항]
+- 다이버전스 비교 기준을 "lookback 구간 내 단순 최고/최저 캔들"에서
+  "좌우 캔들(PIVOT_LEFT/RIGHT개)보다 실제로 튀어나온 스윙 피벗(pivot high/low)"
+  으로 변경. → 트렌드 도중의 캔들이 잘못 기준점으로 잡혀서 엉뚱한 곳에서
+  신호가 뜨던 문제를 해결.
+- 비교 기준 스윙 피벗은 현재 캔들로부터 최소 MIN_PIVOT_DISTANCE(=7)개
+  이상 떨어져 있어야만 후보로 인정. → 너무 최근(바로 몇 캔들 전)의
+  피벗을 기준 삼아 생기던 노이즈성 신호 방지.
+- 캔들 꼬리/몸통 모양 조건은 원래 기준(꼬리>=몸통) 그대로 유지.
 """
 
 import ccxt
@@ -26,15 +36,26 @@ TIMEFRAMES = [
     {"tf": "15m", "ms": 15 * 60 * 1000, "lookback": 30},
     {"tf": "1h", "ms": 60 * 60 * 1000, "lookback": 30},
     {"tf": "4h", "ms": 4 * 60 * 60 * 1000, "lookback": 30},
+    {"tf": "12h", "ms": 12 * 60 * 60 * 1000, "lookback": 30},
+    {"tf": "1d", "ms": 24 * 60 * 60 * 1000, "lookback": 30},
 ]
 
 # RSI 설정
 RSI_PERIOD = 14          # RSI 계산 기간 (표준 14)
 RSI_WARMUP_BARS = 100    # RSI 값이 안정화되도록 lookback 앞에 추가로 확보하는 캔들 수
 
-# 캔들 모양 설정
+# --- 캔들 모양 설정 (원래 기준 유지) ---
 # 반대쪽 꼬리(신호 방향이 아닌 쪽)는 캔들 전체 범위(고가-저가) 대비 이 비율 이내로 짧아야 함
 MAX_OPPOSITE_WICK_RATIO = 0.15
+
+# --- 스윙 피벗(다이버전스 비교 기준점) 탐지 설정 ---
+# 어떤 캔들이 "스윙 고점/저점"으로 인정되려면 좌우 이만큼의 캔들보다 더 튀어나와야 함
+PIVOT_LEFT = 2
+PIVOT_RIGHT = 2
+
+# 다이버전스 비교 기준으로 쓸 스윙 피벗은 현재 캔들로부터 최소 이만큼(개수) 떨어져 있어야 함
+# → 너무 가까운(직전 몇 개 캔들 안의) 피벗을 기준으로 삼아서 생기는 노이즈성 신호 방지
+MIN_PIVOT_DISTANCE = 7
 
 # 루프 모드에서 깨어나는 주기(초). 가장 짧은 타임프레임(15m) 기준.
 TICK_INTERVAL_SEC = 15 * 60
@@ -167,18 +188,50 @@ def compute_rsi(closes, period: int = RSI_PERIOD):
     return rsi
 
 
+# ============================== PIVOT (스윙 고점/저점) ==============================
+
+
+def find_pivot_highs(window, left: int = PIVOT_LEFT, right: int = PIVOT_RIGHT):
+    """window 안에서 좌우 각각 left/right개 캔들보다 고가가 높거나 같은
+    '진짜' 스윙 고점 캔들들의 인덱스 리스트를 반환. 그냥 구간 내 최댓값이
+    아니라, 실제로 양옆보다 튀어나온 지점만 피벗으로 인정한다."""
+    pivots = []
+    n = len(window)
+    for i in range(left, n - right):
+        h = window[i][2]
+        if all(window[j][2] <= h for j in range(i - left, i)) and \
+           all(window[j][2] <= h for j in range(i + 1, i + 1 + right)):
+            pivots.append(i)
+    return pivots
+
+
+def find_pivot_lows(window, left: int = PIVOT_LEFT, right: int = PIVOT_RIGHT):
+    """find_pivot_highs와 대칭. 좌우보다 저가가 낮거나 같은 스윙 저점만 인정."""
+    pivots = []
+    n = len(window)
+    for i in range(left, n - right):
+        l = window[i][3]
+        if all(window[j][3] >= l for j in range(i - left, i)) and \
+           all(window[j][3] >= l for j in range(i + 1, i + 1 + right)):
+            pivots.append(i)
+    return pivots
+
+
 # ============================== SIGNAL DEFINITIONS ==============================
 #
-# 두 신호 모두 "직전 캔들들(현재 캔들 제외) 극값 대비 현재 캔들이 극값을 갱신 +
-# 반대 방향 마감 + 갱신 방향 꼬리가 몸통보다 크거나 같음 + RSI 다이버전스"라는
-# 동일한 뼈대를 공유하고, 방향만 반대입니다.
+# 두 신호 모두 "직전 스윙 극값 대비 현재 캔들이 극값을 갱신 +
+# 반대 방향 마감 + 갱신 방향 꼬리가 몸통보다 확실히 크고 몸통은 작음 +
+# RSI가 직전 스윙 피벗 대비 최소 갭 이상 다이버전스"라는 동일한 뼈대를
+# 공유하고, 방향만 반대입니다.
 #
 #  - 역망치 음봉(inverted_hammer_bearish):
-#      직전 구간 대비 신고가 + 음봉(종가<시가) + 윗꼬리 >= 몸통
-#      + RSI 하락 다이버전스(현재 RSI < 직전 고점 캔들의 RSI) → 상단에서 매도세 유입 신호
+#      직전 스윙고점 대비 신고가 + 음봉(종가<시가) + 윗꼬리>=몸통*2 + 몸통 작음
+#      + RSI 하락 다이버전스(현재 RSI가 직전 스윙고점 RSI보다 갭 이상 낮음)
+#      → 상단에서 매도세 유입 신호
 #  - 망치 양봉(hammer_bullish):
-#      직전 구간 대비 신저가 + 양봉(종가>시가) + 아랫꼬리 >= 몸통
-#      + RSI 상승 다이버전스(현재 RSI > 직전 저점 캔들의 RSI) → 하단에서 매수세 유입 신호
+#      직전 스윙저점 대비 신저가 + 양봉(종가>시가) + 아랫꼬리>=몸통*2 + 몸통 작음
+#      + RSI 상승 다이버전스(현재 RSI가 직전 스윙저점 RSI보다 갭 이상 높음)
+#      → 하단에서 매수세 유입 신호
 
 
 def check_inverted_hammer_bearish(candles, rsi_series, lookback: int):
@@ -212,10 +265,17 @@ def check_inverted_hammer_bearish(candles, rsi_series, lookback: int):
     is_opposite_wick_ok = opposite_wick <= candle_range * MAX_OPPOSITE_WICK_RATIO  # 밑꼬리는 없거나 매우 짧아야 함
     is_shape_ok = is_wick_ok and is_opposite_wick_ok
 
-    # 직전 구간에서 고점을 찍었던 캔들의 RSI
-    peak_idx = max(range(len(prior_window)), key=lambda i: prior_window[i][2])
+    # 직전 구간에서 "진짜 스윙 고점"(양옆 캔들보다 확실히 높은 캔들)이었던 것들 중,
+    # 현재 캔들로부터 최소 MIN_PIVOT_DISTANCE개 이상 떨어진 것만 후보로 삼고,
+    # 그중 가장 높은 것을 비교 기준으로 사용
+    pivot_idxs = find_pivot_highs(prior_window)
+    pivot_idxs = [i for i in pivot_idxs if (len(prior_window) - i) >= MIN_PIVOT_DISTANCE]
+    if not pivot_idxs:
+        return False, None  # 참조할 스윙 고점이 없으면 판단 불가 → 신호 없음
+    peak_idx = max(pivot_idxs, key=lambda i: prior_window[i][2])
     prior_peak_rsi = prior_rsi[peak_idx]
     prior_peak_high = prior_window[peak_idx][2]
+
     is_bearish_divergence = cur_rsi < prior_peak_rsi
 
     ok = is_new_extreme and is_directional and is_shape_ok and is_bearish_divergence
@@ -228,11 +288,11 @@ def check_inverted_hammer_bearish(candles, rsi_series, lookback: int):
         "extreme_label": "신고가",
         "extreme_diff_pct": extreme_diff_pct,
         "extreme_diff_label": "고가 대비 종가 하락률",
-        "condition_label": "신고가 갱신 + 음봉 + 윗꼬리≥몸통 + 밑꼬리 짧음 + RSI 하락다이버전스",
+        "condition_label": "신고가 갱신 + 음봉 + 윗꼬리≥몸통 + 밑꼬리 짧음 + RSI 하락다이버전스(스윙피벗 기준, 최소 %d개 이전)" % MIN_PIVOT_DISTANCE,
         "cur_rsi": cur_rsi,
         "ref_rsi": prior_peak_rsi,
         "ref_price": prior_peak_high,
-        "ref_label": "직전 고점",
+        "ref_label": "직전 스윙고점",
     }
     return ok, detail
 
@@ -268,10 +328,17 @@ def check_hammer_bullish(candles, rsi_series, lookback: int):
     is_opposite_wick_ok = opposite_wick <= candle_range * MAX_OPPOSITE_WICK_RATIO  # 윗꼬리는 없거나 매우 짧아야 함
     is_shape_ok = is_wick_ok and is_opposite_wick_ok
 
-    # 직전 구간에서 저점을 찍었던 캔들의 RSI
-    trough_idx = min(range(len(prior_window)), key=lambda i: prior_window[i][3])
+    # 직전 구간에서 "진짜 스윙 저점"(양옆 캔들보다 확실히 낮은 캔들)이었던 것들 중,
+    # 현재 캔들로부터 최소 MIN_PIVOT_DISTANCE개 이상 떨어진 것만 후보로 삼고,
+    # 그중 가장 낮은 것을 비교 기준으로 사용
+    pivot_idxs = find_pivot_lows(prior_window)
+    pivot_idxs = [i for i in pivot_idxs if (len(prior_window) - i) >= MIN_PIVOT_DISTANCE]
+    if not pivot_idxs:
+        return False, None  # 참조할 스윙 저점이 없으면 판단 불가 → 신호 없음
+    trough_idx = min(pivot_idxs, key=lambda i: prior_window[i][3])
     prior_trough_rsi = prior_rsi[trough_idx]
     prior_trough_low = prior_window[trough_idx][3]
+
     is_bullish_divergence = cur_rsi > prior_trough_rsi
 
     ok = is_new_extreme and is_directional and is_shape_ok and is_bullish_divergence
@@ -284,11 +351,11 @@ def check_hammer_bullish(candles, rsi_series, lookback: int):
         "extreme_label": "신저가",
         "extreme_diff_pct": extreme_diff_pct,
         "extreme_diff_label": "저가 대비 종가 상승률",
-        "condition_label": "신저가 갱신 + 양봉 + 아랫꼬리≥몸통 + 윗꼬리 짧음 + RSI 상승다이버전스",
+        "condition_label": "신저가 갱신 + 양봉 + 아랫꼬리≥몸통 + 윗꼬리 짧음 + RSI 상승다이버전스(스윙피벗 기준, 최소 %d개 이전)" % MIN_PIVOT_DISTANCE,
         "cur_rsi": cur_rsi,
         "ref_rsi": prior_trough_rsi,
         "ref_price": prior_trough_low,
-        "ref_label": "직전 저점",
+        "ref_label": "직전 스윙저점",
     }
     return ok, detail
 
