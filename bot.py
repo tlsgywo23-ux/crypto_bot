@@ -37,10 +37,18 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "여기에_봇_토큰_
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "여기에_챗ID_입력")
 
 # 감시할 타임프레임 목록 (lookback: 극값/다이버전스 판단에 사용하는 캔들 개수)
+# group: 실행 그룹 구분용. 각 그룹은 해당 타임프레임의 캔들 마감 주기에 맞춰
+#        딱 그만큼만 자주 체크하도록 나눠서, 불필요한 API 호출/Actions 사용량을 줄인다.
+#   "short" = 15분마다 도는 워크플로우에서 체크 (15m 캔들은 15분마다 마감되므로
+#             이 주기로 체크해야만 놓치지 않음)
+#   "long"  = 1시간마다 도는 워크플로우에서 체크 (1h/4h는 어차피 캔들이 1시간
+#             단위 이상으로만 마감되므로, 15분마다 체크해봤자 대부분 "아직
+#             그대로"라 API 호출만 낭비. 1시간 주기로 체크해도 놓치는 캔들 없음)
 TIMEFRAMES = [
-    {"tf": "15m", "ms": 15 * 60 * 1000, "lookback": 30},
-    {"tf": "1h", "ms": 60 * 60 * 1000, "lookback": 30},
-    {"tf": "4h", "ms": 4 * 60 * 60 * 1000, "lookback": 30},
+    {"tf": "15m", "ms": 15 * 60 * 1000, "lookback": 30, "group": "short"},
+    {"tf": "1h", "ms": 60 * 60 * 1000, "lookback": 30, "group": "long"},
+    {"tf": "4h", "ms": 4 * 60 * 60 * 1000, "lookback": 30, "group": "long"},
+    {"tf": "12h", "ms": 12 * 60 * 60 * 1000, "lookback": 30, "group": "long"},
 ]
 
 # RSI 설정
@@ -478,17 +486,22 @@ def check_symbol_timeframe(exchange, symbol, state, tf_conf, candles_cache):
         state[key] = latest_candle_ts
 
 
-def check_all_symbols(exchange: ccxt.okx, symbols, state: dict):
+def check_all_symbols(exchange: ccxt.okx, symbols, state: dict, timeframes=None):
     """모든 타임프레임 x 모든 신호 조합을 심볼별로 체크
+
+    timeframes: 이번 실행에서 체크할 타임프레임 목록 (기본값: 전체 TIMEFRAMES).
+                --group 옵션으로 short/long 그룹만 골라서 넘길 수 있음.
 
     타임프레임 하나에서 오류(네트워크 순단 등)가 나도 같은 심볼의
     나머지 타임프레임 체크는 계속 진행되도록, try/except를 타임프레임
     단위로 감쌉니다. (심볼 단위로 감싸면 15m에서 에러 시 1h/4h까지
     이번 회차에서 통째로 스킵되는 문제가 있었음)
     """
+    if timeframes is None:
+        timeframes = TIMEFRAMES
     for symbol in symbols:
         candles_cache = {}
-        for tf_conf in TIMEFRAMES:
+        for tf_conf in timeframes:
             try:
                 check_symbol_timeframe(exchange, symbol, state, tf_conf, candles_cache)
             except ccxt.BaseError as e:
@@ -508,13 +521,26 @@ def seconds_until_next_close():
     return wait + CLOSE_BUFFER_SEC
 
 
-def run_once():
-    # 외부 스케줄러(cron-job.org)가 정각(0,15,30,45분)에 정확히 이 실행을
-    # 트리거하므로, 캔들이 거래소에 완전히 반영될 시간을 벌기 위해
-    # 여기서 CLOSE_BUFFER_SEC(12초)만큼 대기한 뒤 체크를 시작한다.
+def resolve_timeframes(group: str):
+    """--group 값에 따라 이번 실행에서 체크할 타임프레임 목록을 결정.
+    "all"이면 전체, 그 외엔 group 필드가 일치하는 것만."""
+    if group == "all":
+        return TIMEFRAMES
+    return [t for t in TIMEFRAMES if t["group"] == group]
+
+
+def run_once(group: str = "all"):
+    # 외부 스케줄러(cron-job.org)가 정각에 정확히 이 실행을 트리거하므로,
+    # 캔들이 거래소에 완전히 반영될 시간을 벌기 위해 여기서
+    # CLOSE_BUFFER_SEC(12초)만큼 대기한 뒤 체크를 시작한다.
     log.info("정각 트리거 감지 → %d초 대기 후 체크 시작", CLOSE_BUFFER_SEC)
     time.sleep(CLOSE_BUFFER_SEC)
 
+    timeframes = resolve_timeframes(group)
+    if not timeframes:
+        log.error("group=%s 에 해당하는 타임프레임이 없습니다.", group)
+        return
+
     exchange = build_exchange()
     symbols = resolve_symbols(exchange, RAW_SYMBOLS)
     if not symbols:
@@ -523,16 +549,22 @@ def run_once():
 
     state = load_state()
     log.info(
-        "1회성 체크 실행 (%d개 심볼, 타임프레임: %s, 신호: %s)",
+        "1회성 체크 실행 (%d개 심볼, group=%s, 타임프레임: %s, 신호: %s)",
         len(symbols),
-        ", ".join(t["tf"] for t in TIMEFRAMES),
+        group,
+        ", ".join(t["tf"] for t in timeframes),
         ", ".join(s["name"] for s in SIGNALS),
     )
-    check_all_symbols(exchange, symbols, state)
+    check_all_symbols(exchange, symbols, state, timeframes)
     save_state(state)
 
 
-def run_loop():
+def run_loop(group: str = "all"):
+    timeframes = resolve_timeframes(group)
+    if not timeframes:
+        log.error("group=%s 에 해당하는 타임프레임이 없습니다.", group)
+        return
+
     exchange = build_exchange()
     symbols = resolve_symbols(exchange, RAW_SYMBOLS)
     if not symbols:
@@ -541,9 +573,10 @@ def run_loop():
 
     state = load_state()
     log.info(
-        "캔들 감시를 시작합니다. (%d개 심볼, 타임프레임: %s, 신호: %s)",
+        "캔들 감시를 시작합니다. (%d개 심볼, group=%s, 타임프레임: %s, 신호: %s)",
         len(symbols),
-        ", ".join(t["tf"] for t in TIMEFRAMES),
+        group,
+        ", ".join(t["tf"] for t in timeframes),
         ", ".join(s["name"] for s in SIGNALS),
     )
 
@@ -552,19 +585,25 @@ def run_loop():
         log.info("다음 체크 틱까지 %.0f초 대기", wait_sec)
         time.sleep(wait_sec)
         log.info("틱 발생 → 전 타임프레임/전 신호/전 종목 조건 체크 시작")
-        check_all_symbols(exchange, symbols, state)
+        check_all_symbols(exchange, symbols, state, timeframes)
         save_state(state)
 
 
 def main():
     parser = argparse.ArgumentParser(description="OKX 캔들 신호 감시 봇 (15m/1h/4h, 역망치음봉/망치양봉 + RSI 다이버전스 + 거래량 필터)")
     parser.add_argument("--once", action="store_true", help="1회만 체크하고 종료")
+    parser.add_argument(
+        "--group",
+        choices=["all", "short", "long"],
+        default="all",
+        help="체크할 타임프레임 그룹 (short=15m, long=1h/4h, all=전체). 기본값 all",
+    )
     args = parser.parse_args()
 
     if args.once:
-        run_once()
+        run_once(args.group)
     else:
-        run_loop()
+        run_loop(args.group)
 
 
 if __name__ == "__main__":
