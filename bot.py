@@ -82,6 +82,7 @@ RAW_SYMBOLS = [
     "NEAR", "XRP", "SUI", "ONDO", "WLD", "ALLO", "H", "OPN", "CRV", "DOGE",
     "BSB", "HOME", "SAHARA", "HMSTR", "TRUMP", "EDGE", "PEPE", "XPL", "SPACE",
     "COAI", "RE", "ADA", "O", "BASED", "HYPE", "SLX", "NES", "CAP", "LIT", "BNB",
+    "BICO", "KAITO", "MMT", "SNDK", "PUMP", "MUBARAK", "GIGGLE", "GRVT", "OKX", "UB",
 ]
 
 # 심볼 이름 -> RAW_SYMBOLS 안에서의 순번(1부터 시작) 조회용
