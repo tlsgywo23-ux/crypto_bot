@@ -3,10 +3,23 @@ OKX 캔들 신호 백테스트 스크립트
 - bot.py에 있는 신호 판단 로직(check_inverted_hammer_bearish, check_hammer_bullish)을
   그대로 가져와서 씁니다. 로직을 따로 베끼지 않기 때문에, bot.py의 조건을 바꾸면
   백테스트에도 자동으로 반영됩니다.
-- 최근 BACKTEST_MONTHS 개월치 캔들에서 신호가 발생했던 모든 지점을 찾고,
-  신호 발생 이후 FOLLOW_CANDLES_LIST에 있는 각 추적 기간(예: 5봉, 10봉) 동안의
-  가격 움직임으로 성공/실패를 판정합니다. 같은 신호 하나당 추적 기간별로
-  결과 행이 하나씩 생기고, "추적봉수" 컬럼으로 구분됩니다.
+- 최근 BACKTEST_MONTHS 개월치 캔들에서 신호가 발생했던 모든 지점을 찾고, 두 가지
+  방식으로 결과를 판정합니다.
+
+  [방식 1] 고정 N봉 방식 (FOLLOW_CANDLES_LIST)
+    신호 후 정확히 N개 캔들이 지난 시점의 종가로 손익을 계산.
+    5봉, 10봉처럼 여러 개를 넣으면 각각 결과가 나옵니다.
+
+  [방식 2] TP/SL 방식 (TP_PCT / SL_PCT)
+    진입가 대비 진입 방향으로 TP_PCT%만큼 가면 익절, 반대로 SL_PCT%만큼 가면
+    손절로 보고, 신호 이후 캔들을 하나씩 따라가며 먼저 닿는 쪽으로 판정.
+    한 캔들 안에서 TP/SL이 동시에 걸릴 수 있는 경우(그 캔들의 고가는 TP 위,
+    저가는 SL 아래) OHLC 데이터만으로는 어느 게 먼저 찍혔는지 알 수 없어서,
+    보수적으로 SL이 먼저 걸린 것으로 간주합니다. TP_SL_MAX_FOLLOW 캔들
+    안에 둘 다 안 걸리면 "미결정"으로 분류해서 승률 계산에서 제외합니다.
+
+  두 방식 모두 같은 신호 지점에서 계산되고, 결과 표에는 "추적기준" 컬럼으로
+  구분됩니다 (예: "5봉", "10봉", "TP5%/SL2.5%").
 - 결과는 엑셀 파일(backtest_result.xlsx)로 저장하고, 요약은 텔레그램으로도 전송합니다.
 
 [타임프레임 관련]
@@ -38,9 +51,14 @@ from bot import (
 
 BACKTEST_MONTHS = 6      # 몇 개월치 과거 데이터를 볼지
 
-# 신호 발생 이후 몇 개 캔들까지의 움직임으로 성공/실패를 판정할지.
+# [방식 1] 신호 발생 이후 몇 개 캔들까지의 움직임으로 성공/실패를 판정할지.
 # 여러 개를 넣으면 각각에 대한 결과를 한 번의 백테스트로 같이 뽑습니다.
 FOLLOW_CANDLES_LIST = [5, 10]
+
+# [방식 2] TP/SL 방식 설정
+TP_PCT = 5.0    # 진입 방향으로 이만큼(%) 가면 익절
+SL_PCT = 2.5    # 진입 반대 방향으로 이만큼(%) 가면 손절
+TP_SL_MAX_FOLLOW = 50   # 이 캔들 수 안에 TP/SL 둘 다 안 걸리면 "미결정"으로 분류
 
 OUTPUT_XLSX = "backtest_result.xlsx"
 
@@ -54,6 +72,8 @@ BACKTEST_TIMEFRAMES = [
     {"tf": "12h", "ms": 12 * 60 * 60 * 1000, "lookback": 30},
     {"tf": "1d", "ms": 24 * 60 * 60 * 1000, "lookback": 30},
 ]
+
+TP_SL_LABEL = f"TP{TP_PCT:g}%/SL{SL_PCT:g}%"
 
 log = logging.getLogger("backtest")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -114,7 +134,7 @@ def fetch_full_history(exchange, symbol, timeframe, timeframe_ms, months):
     return [dedup[k] for k in sorted(dedup.keys())]
 
 
-# ============================== OUTCOME 계산 ==============================
+# ============================== OUTCOME 계산 (방식 1: 고정 N봉) ==============================
 
 
 def evaluate_outcome(candles, signal_idx, direction, follow_n):
@@ -149,15 +169,63 @@ def evaluate_outcome(candles, signal_idx, direction, follow_n):
     }
 
 
+# ============================== OUTCOME 계산 (방식 2: TP/SL) ==============================
+
+
+def evaluate_tp_sl_outcome(candles, signal_idx, direction, tp_pct, sl_pct, max_follow):
+    """signal_idx 캔들의 종가를 진입가로 보고, 이후 캔들을 하나씩 따라가며
+    TP(익절)와 SL(손절) 중 어느 쪽을 먼저 건드리는지 판정.
+
+    - 롱(direction="long"): 진입가 대비 +tp_pct%면 익절, -sl_pct%면 손절
+    - 숏(direction="short"): 진입가 대비 -tp_pct%면 익절, +sl_pct%면 손절
+    - 한 캔들 안에서 TP/SL이 동시에 걸릴 수 있는 경우(고가는 TP 이상, 저가는
+      SL 이하) 캔들 내부 체결 순서는 알 수 없으므로 보수적으로 SL이 먼저
+      걸린 것으로 간주합니다.
+    - max_follow 캔들 안에 TP도 SL도 안 걸리면 result=None (미결정) 반환.
+    - 데이터 자체가 부족해서 판정 불가한 경우도 result=None."""
+    entry_price = candles[signal_idx][4]
+
+    if direction == "long":
+        tp_price = entry_price * (1 + tp_pct / 100)
+        sl_price = entry_price * (1 - sl_pct / 100)
+    else:
+        tp_price = entry_price * (1 - tp_pct / 100)
+        sl_price = entry_price * (1 + sl_pct / 100)
+
+    future = candles[signal_idx + 1: signal_idx + 1 + max_follow]
+
+    for offset, cd in enumerate(future, start=1):
+        high, low = cd[2], cd[3]
+
+        if direction == "long":
+            hit_tp = high >= tp_price
+            hit_sl = low <= sl_price
+        else:
+            hit_tp = low <= tp_price
+            hit_sl = high >= sl_price
+
+        if hit_tp and hit_sl:
+            # 같은 캔들 안에서 둘 다 걸림 → 보수적으로 SL 먼저 걸린 것으로 간주
+            return {"result": "SL", "pnl_pct": -sl_pct, "bars_to_result": offset, "success": False}
+        if hit_sl:
+            return {"result": "SL", "pnl_pct": -sl_pct, "bars_to_result": offset, "success": False}
+        if hit_tp:
+            return {"result": "TP", "pnl_pct": tp_pct, "bars_to_result": offset, "success": True}
+
+    return None  # max_follow 안에 미결정 (또는 데이터 부족)
+
+
 # ============================== 메인 백테스트 루프 ==============================
 
 
 def run_backtest() -> pd.DataFrame:
     exchange = build_exchange()
     symbols = resolve_symbols(exchange, RAW_SYMBOLS)
-    max_follow = max(FOLLOW_CANDLES_LIST)
+    max_fixed_follow = max(FOLLOW_CANDLES_LIST)
 
     rows = []
+    tpsl_undetermined_count = 0
+
     for symbol in symbols:
         raw_symbol = symbol.split("/")[0]
         rank = SYMBOL_RANK.get(raw_symbol)
@@ -178,9 +246,9 @@ def run_backtest() -> pd.DataFrame:
             rsi_series = compute_rsi(closes, RSI_PERIOD)
 
             min_needed = lookback + RSI_PERIOD + RSI_WARMUP_BARS
-            # 가장 긴 추적 기간(max_follow) 기준으로 범위를 잡아서, 5봉/10봉
-            # 결과가 항상 "같은 신호 집합"에 대해 나오도록 함 (비교 공정성)
-            for i in range(min_needed, len(candles) - max_follow):
+            # TP/SL 판정에 필요한 여유분까지 감안해서 뒤쪽 여백을 잡음
+            tail_margin = max(max_fixed_follow, TP_SL_MAX_FOLLOW)
+            for i in range(min_needed, len(candles) - tail_margin):
                 window = candles[i - lookback + 1: i + 1]
                 rsi_window = rsi_series[i - lookback + 1: i + 1]
 
@@ -194,26 +262,52 @@ def run_backtest() -> pd.DataFrame:
                         candles[i][0] / 1000, tz=KST
                     ).strftime("%Y-%m-%d %H:%M")
 
+                    base_row = {
+                        "종목": raw_symbol,
+                        "순번": rank,
+                        "타임프레임": timeframe,
+                        "신호": sig["name"],
+                        "마감시각(KST)": candle_time_str,
+                        "진입가": candles[i][4],
+                    }
+
+                    # 방식 1: 고정 N봉
                     for follow_n in FOLLOW_CANDLES_LIST:
                         outcome = evaluate_outcome(candles, i, direction, follow_n)
                         if outcome is None:
                             continue
-
                         rows.append({
-                            "종목": raw_symbol,
-                            "순번": rank,
-                            "타임프레임": timeframe,
-                            "신호": sig["name"],
-                            "추적봉수": follow_n,
-                            "마감시각(KST)": candle_time_str,
-                            "진입가": candles[i][4],
+                            **base_row,
+                            "추적기준": f"{follow_n}봉",
                             "수익률(%)": round(outcome["pnl_pct"], 2),
                             "최대유리(%)": round(outcome["best_pct"], 2),
                             "최대불리(%)": round(outcome["worst_pct"], 2),
+                            "체결까지_걸린봉수": None,
                             "성공여부": "성공" if outcome["success"] else "실패",
                         })
 
-            log.info("[%s|%s] 누적 신호 %d건", raw_symbol, timeframe, len(rows))
+                    # 방식 2: TP/SL
+                    tpsl = evaluate_tp_sl_outcome(candles, i, direction, TP_PCT, SL_PCT, TP_SL_MAX_FOLLOW)
+                    if tpsl is None:
+                        tpsl_undetermined_count += 1
+                    else:
+                        rows.append({
+                            **base_row,
+                            "추적기준": TP_SL_LABEL,
+                            "수익률(%)": round(tpsl["pnl_pct"], 2),
+                            "최대유리(%)": None,
+                            "최대불리(%)": None,
+                            "체결까지_걸린봉수": tpsl["bars_to_result"],
+                            "성공여부": "성공" if tpsl["success"] else "실패",
+                        })
+
+            log.info("[%s|%s] 누적 결과행 %d건", raw_symbol, timeframe, len(rows))
+
+    if tpsl_undetermined_count:
+        log.info(
+            "TP/SL 방식에서 %d건은 %d봉 안에 결정 안 나서 미결정 처리(승률 계산 제외)",
+            tpsl_undetermined_count, TP_SL_MAX_FOLLOW,
+        )
 
     return pd.DataFrame(rows)
 
@@ -225,15 +319,17 @@ def build_summary(df: pd.DataFrame) -> str:
     if df.empty:
         return f"📊 백테스트 결과: 지난 {BACKTEST_MONTHS}개월 동안 조건을 만족한 신호가 하나도 없었습니다."
 
+    labels = [f"{n}봉" for n in FOLLOW_CANDLES_LIST] + [TP_SL_LABEL]
+
     lines = [
         f"📊 백테스트 결과 요약",
         f"(최근 {BACKTEST_MONTHS}개월, 수익률은 진입방향 기준 +/-)",
     ]
 
-    for follow_n in FOLLOW_CANDLES_LIST:
-        sub = df[df["추적봉수"] == follow_n]
+    for label in labels:
+        sub = df[df["추적기준"] == label]
         lines.append("")
-        lines.append(f"════ {follow_n}봉 추적 기준 ════")
+        lines.append(f"════ {label} 기준 ════")
         if sub.empty:
             lines.append("해당 없음")
             continue
@@ -259,6 +355,7 @@ def build_summary(df: pd.DataFrame) -> str:
             )
 
     lines.append("")
+    lines.append(f"※ {TP_SL_LABEL} 기준은 진입방향 기준 +{TP_PCT:g}% 도달 시 익절, -{SL_PCT:g}% 도달 시 손절로 판정했습니다.")
     lines.append("(종목·시각별 상세 내역은 첨부된 엑셀 파일 참고)")
     return "\n".join(lines)
 
@@ -267,35 +364,38 @@ def build_summary(df: pd.DataFrame) -> str:
 
 
 def build_breakdown(df: pd.DataFrame) -> pd.DataFrame:
-    """종목 x 타임프레임 x 신호유형 x 추적봉수 조합별로 승률/평균 수익률을 집계한 표"""
+    """종목 x 타임프레임 x 신호유형 x 추적기준 조합별로 승률/평균 수익률을 집계한 표"""
     if df.empty:
         return pd.DataFrame(columns=[
-            "종목", "순번", "타임프레임", "신호", "추적봉수",
+            "종목", "순번", "타임프레임", "신호", "추적기준",
             "신호건수", "승률(%)", "평균수익률(%)",
         ])
 
     rows = []
-    for (symbol, rank, tf, sig, follow_n), g in df.groupby(["종목", "순번", "타임프레임", "신호", "추적봉수"]):
+    for (symbol, rank, tf, sig, label), g in df.groupby(["종목", "순번", "타임프레임", "신호", "추적기준"]):
         rows.append({
             "종목": symbol,
             "순번": rank,
             "타임프레임": tf,
             "신호": sig,
-            "추적봉수": follow_n,
+            "추적기준": label,
             "신호건수": len(g),
             "승률(%)": round((g["성공여부"] == "성공").mean() * 100, 1),
             "평균수익률(%)": round(g["수익률(%)"].mean(), 2),
         })
 
     breakdown = pd.DataFrame(rows)
-    # 추적봉수 -> 신호건수 많은 순 -> 승률 높은 순으로 정렬해서 보기 편하게
+    # 추적기준 -> 신호건수 많은 순 -> 승률 높은 순으로 정렬해서 보기 편하게
     return breakdown.sort_values(
-        by=["추적봉수", "신호건수", "승률(%)"], ascending=[True, False, False]
+        by=["추적기준", "신호건수", "승률(%)"], ascending=[True, False, False]
     ).reset_index(drop=True)
 
 
 def main():
-    log.info("백테스트 시작 (최근 %d개월, 추적봉수: %s)", BACKTEST_MONTHS, FOLLOW_CANDLES_LIST)
+    log.info(
+        "백테스트 시작 (최근 %d개월, 고정봉: %s, TP/SL: +%.1f%%/-%.1f%%)",
+        BACKTEST_MONTHS, FOLLOW_CANDLES_LIST, TP_PCT, SL_PCT,
+    )
     df = run_backtest()
 
     breakdown_df = build_breakdown(df)
