@@ -20,6 +20,12 @@ OKX 무기한 선물(perpetual swap) 캔들 신호 감시 봇
 - [신규] 현재 캔들 거래량이 직전 구간 평균 대비 유의미하게 터졌을 때만
   신호가 나가도록 거래량 필터 추가. → 캔들 모양/다이버전스 조건은
   맞아도 거래량이 평소 수준이면(=시장 관심 없이 그냥 형성된 캔들) 신호 제외.
+- [신규] 상태 파일(STATE_FILE)을 --group 값에 따라 자동으로 분리
+  (alert_state_short.json / alert_state_long.json). 15분마다 도는
+  워크플로우와 1시간마다 도는 워크플로우가 서로 다른 파일을 커밋하게
+  되어, 두 워크플로우가 같은 alert_state.json을 동시에 건드리다가
+  git merge conflict가 나던 문제를 방지. 환경변수 STATE_FILE을 명시적으로
+  지정하면 그 값이 항상 최우선.
 """
 
 import ccxt
@@ -83,7 +89,8 @@ CLOSE_BUFFER_SEC = 12
 # 캔들 마감시각을 텔레그램 메시지에 표시할 때 쓰는 타임존 (한국시간)
 KST = datetime.timezone(datetime.timedelta(hours=9))
 
-STATE_FILE = os.environ.get("STATE_FILE", "alert_state.json")
+# 상태 파일(중복 알람 방지용) 기본 이름. group="all"이거나 group을 안 쓸 때 사용.
+DEFAULT_STATE_FILE = "alert_state.json"
 
 RAW_SYMBOLS = [
     "BTC", "ETH", "ZEC", "MU", "BCH", "LINK", "BEAT", "SOL", "SOXL", "LAB",
@@ -152,19 +159,41 @@ def resolve_symbols(exchange: ccxt.okx, raw_symbols):
 # ============================== STATE (중복 알람 방지) ==============================
 
 
-def load_state():
-    if os.path.exists(STATE_FILE):
+def resolve_state_file(group: str) -> str:
+    """이번 실행에서 쓸 상태 파일 경로를 결정.
+
+    우선순위:
+    1) 환경변수 STATE_FILE이 명시적으로 지정되어 있으면 그 값을 그대로 사용
+       (워크플로우 yml에서 직접 지정하고 싶을 때를 위한 탈출구).
+    2) 지정 안 되어 있으면 group에 따라 자동 분기:
+       - group == "all" → alert_state.json (기존 단일 워크플로우 방식과 동일)
+       - group == "short"/"long" 등 → alert_state_{group}.json
+
+    이렇게 group별로 파일을 분리하면, 15분마다 도는 워크플로우와 1시간마다
+    도는 워크플로우가 서로 다른 파일을 커밋하게 되어 동시 실행 시 같은
+    파일을 두고 git merge conflict가 나는 문제를 원천적으로 막을 수 있다.
+    """
+    env_override = os.environ.get("STATE_FILE")
+    if env_override:
+        return env_override
+    if group == "all":
+        return DEFAULT_STATE_FILE
+    return f"alert_state_{group}.json"
+
+
+def load_state(state_file: str):
+    if os.path.exists(state_file):
         try:
-            with open(STATE_FILE, "r") as f:
+            with open(state_file, "r") as f:
                 return json.load(f)
         except Exception as e:
             log.warning("상태 파일 로드 실패, 빈 상태로 시작: %s", e)
     return {}
 
 
-def save_state(state):
+def save_state(state, state_file: str):
     try:
-        with open(STATE_FILE, "w") as f:
+        with open(state_file, "w") as f:
             json.dump(state, f)
     except Exception as e:
         log.error("상태 파일 저장 실패: %s", e)
@@ -541,13 +570,16 @@ def run_once(group: str = "all"):
         log.error("group=%s 에 해당하는 타임프레임이 없습니다.", group)
         return
 
+    state_file = resolve_state_file(group)
+    log.info("상태 파일: %s", state_file)
+
     exchange = build_exchange()
     symbols = resolve_symbols(exchange, RAW_SYMBOLS)
     if not symbols:
         log.error("감시할 심볼이 하나도 없습니다.")
         return
 
-    state = load_state()
+    state = load_state(state_file)
     log.info(
         "1회성 체크 실행 (%d개 심볼, group=%s, 타임프레임: %s, 신호: %s)",
         len(symbols),
@@ -556,7 +588,7 @@ def run_once(group: str = "all"):
         ", ".join(s["name"] for s in SIGNALS),
     )
     check_all_symbols(exchange, symbols, state, timeframes)
-    save_state(state)
+    save_state(state, state_file)
 
 
 def run_loop(group: str = "all"):
@@ -565,13 +597,16 @@ def run_loop(group: str = "all"):
         log.error("group=%s 에 해당하는 타임프레임이 없습니다.", group)
         return
 
+    state_file = resolve_state_file(group)
+    log.info("상태 파일: %s", state_file)
+
     exchange = build_exchange()
     symbols = resolve_symbols(exchange, RAW_SYMBOLS)
     if not symbols:
         log.error("감시할 심볼이 하나도 없습니다.")
         return
 
-    state = load_state()
+    state = load_state(state_file)
     log.info(
         "캔들 감시를 시작합니다. (%d개 심볼, group=%s, 타임프레임: %s, 신호: %s)",
         len(symbols),
@@ -586,7 +621,7 @@ def run_loop(group: str = "all"):
         time.sleep(wait_sec)
         log.info("틱 발생 → 전 타임프레임/전 신호/전 종목 조건 체크 시작")
         check_all_symbols(exchange, symbols, state, timeframes)
-        save_state(state)
+        save_state(state, state_file)
 
 
 def main():
