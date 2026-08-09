@@ -1,0 +1,38 @@
+name: Crypto Bot (Long TF)
+on:
+  workflow_dispatch:        # 외부 스케줄러(cron-job.org)에서 1시간마다 호출
+permissions:
+  contents: write  # state 파일을 다시 커밋하기 위해 write 권한 필요
+concurrency:
+  group: crypto-bot-run   # bot.yml(15분마다, short)과 같은 그룹으로 묶어서
+                          # 두 워크플로우가 동시에 alert_state.json에 커밋하는 걸 방지
+  cancel-in-progress: false
+jobs:
+  run-bot-long:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+          cache-dependency-path: 'requirements.txt'
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+      - name: Run bot (1h/4h/12h only)
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python bot.py --once --group long
+      - name: Commit updated state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add alert_state.json
+          git diff --staged --quiet || git commit -m "update alert state (long tf) [skip ci]"
+          git pull --rebase origin main
+          git push
