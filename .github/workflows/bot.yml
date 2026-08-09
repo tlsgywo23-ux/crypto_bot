@@ -1,11 +1,11 @@
 name: Crypto Bot
 on:
-  workflow_dispatch:        # 외부 스케줄러(cron-job.org)에서 API로 호출할 때 실행
+  workflow_dispatch:        # 외부 스케줄러(cron-job.org)에서 15분마다 호출
 permissions:
   contents: write  # state 파일을 다시 커밋하기 위해 write 권한 필요
 concurrency:
-  group: crypto-bot-run   # 같은 그룹 = 동시에 하나만 실행되도록 강제
-  cancel-in-progress: false  # 먼저 시작한 실행을 취소하지 않고, 뒤에 온 실행이 대기하도록 함
+  group: crypto-bot-run   # bot-long.yml과 같은 그룹으로 묶어서 동시 커밋 충돌 방지
+  cancel-in-progress: false
 jobs:
   run-bot:
     runs-on: ubuntu-latest
@@ -16,17 +16,17 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-          cache: 'pip'                              # pip 패키지 캐싱 활성화
-          cache-dependency-path: 'requirements.txt'  # 이 파일 내용이 안 바뀌면 캐시 재사용
+          cache: 'pip'
+          cache-dependency-path: 'requirements.txt'
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
-      - name: Run bot
+      - name: Run bot (15m only)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python bot.py --once
+          python bot.py --once --group short
       - name: Commit updated state
         run: |
           git config user.name "github-actions[bot]"
