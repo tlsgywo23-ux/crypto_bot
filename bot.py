@@ -2,9 +2,10 @@
 OKX 무기한 선물(perpetual swap) 캔들 신호 감시 봇
 - 타임프레임: 15분봉 / 1시간봉 / 4시간봉
 - 신호 패턴: 역망치형 음봉(고점 갱신 실패형 매도세) / 망치형 양봉(저점 갱신 후 매수세)
-- 추가 필터: RSI 다이버전스 (진짜 스윙 피벗 기준 + 최소 갭)
+- 추가 필터: RSI 다이버전스 (진짜 스윙 피벗 기준) + 거래량 급증 필터
     * 역망치 음봉: 신고가 갱신 + RSI는 "최소 MIN_PIVOT_DISTANCE개 이전의 스윙 고점"보다 낮음
     * 망치 양봉  : 신저가 갱신 + RSI는 "최소 MIN_PIVOT_DISTANCE개 이전의 스윙 저점"보다 높음
+    * 공통: 현재 캔들 거래량이 직전 구간 평균 거래량 대비 VOLUME_SPIKE_MULTIPLIER배 이상
 
 [2026-08 수정사항]
 - 다이버전스 비교 기준을 "lookback 구간 내 단순 최고/최저 캔들"에서
@@ -16,6 +17,9 @@ OKX 무기한 선물(perpetual swap) 캔들 신호 감시 봇
   피벗을 기준 삼아 생기던 노이즈성 신호 방지.
 - 캔들 꼬리/몸통 모양 조건은 원래 기준(꼬리>=몸통) 그대로 유지.
 - 감시 타임프레임에서 12h, 1d 제거 (15m/1h/4h만 감시).
+- [신규] 현재 캔들 거래량이 직전 구간 평균 대비 유의미하게 터졌을 때만
+  신호가 나가도록 거래량 필터 추가. → 캔들 모양/다이버전스 조건은
+  맞아도 거래량이 평소 수준이면(=시장 관심 없이 그냥 형성된 캔들) 신호 제외.
 """
 
 import ccxt
@@ -55,6 +59,14 @@ PIVOT_RIGHT = 2
 # 다이버전스 비교 기준으로 쓸 스윙 피벗은 현재 캔들로부터 최소 이만큼(개수) 떨어져 있어야 함
 # → 너무 가까운(직전 몇 개 캔들 안의) 피벗을 기준으로 삼아서 생기는 노이즈성 신호 방지
 MIN_PIVOT_DISTANCE = 7
+
+# --- 거래량 급증 필터 ---
+# 현재 캔들 거래량이 "직전 구간 평균 거래량" 대비 이 배수 이상이어야 "유의미하게 터졌다"고 인정.
+# 예: 1.5 = 평소보다 1.5배 이상 거래량이 실려야 신호 인정. 값을 올릴수록 더 강한 거래량 폭증만 통과.
+VOLUME_SPIKE_MULTIPLIER = 1.5
+# 평균 거래량을 계산할 때 볼 직전 캔들 개수 (현재 캔들 제외, 가장 최근 것부터 이만큼).
+# None이면 lookback 구간 전체(prior_window)를 다 사용.
+VOLUME_AVG_LOOKBACK = 20
 
 # 루프 모드에서 깨어나는 주기(초). 가장 짧은 타임프레임(15m) 기준.
 TICK_INTERVAL_SEC = 15 * 60
@@ -216,21 +228,43 @@ def find_pivot_lows(window, left: int = PIVOT_LEFT, right: int = PIVOT_RIGHT):
     return pivots
 
 
+# ============================== VOLUME (거래량 급증 필터) ==============================
+
+
+def check_volume_spike(prior_window, current_volume, multiplier: float = VOLUME_SPIKE_MULTIPLIER,
+                        avg_lookback=VOLUME_AVG_LOOKBACK):
+    """현재 캔들 거래량이 직전 구간 평균 거래량 대비 multiplier배 이상인지 확인.
+    avg_lookback이 주어지면 prior_window 중 가장 최근 그만큼만 평균 계산에 사용,
+    None이면 prior_window 전체를 사용. 반환값: (통과여부, 평균거래량)"""
+    if not prior_window:
+        return False, 0.0
+    ref_candles = prior_window[-avg_lookback:] if avg_lookback else prior_window
+    if not ref_candles:
+        return False, 0.0
+    avg_volume = sum(cd[5] for cd in ref_candles) / len(ref_candles)
+    if avg_volume <= 0:
+        return False, avg_volume
+    is_spike = current_volume >= avg_volume * multiplier
+    return is_spike, avg_volume
+
+
 # ============================== SIGNAL DEFINITIONS ==============================
 #
 # 두 신호 모두 "직전 스윙 극값 대비 현재 캔들이 극값을 갱신 +
-# 반대 방향 마감 + 갱신 방향 꼬리가 몸통보다 확실히 크고 몸통은 작음 +
-# RSI가 직전 스윙 피벗 대비 최소 갭 이상 다이버전스"라는 동일한 뼈대를
-# 공유하고, 방향만 반대입니다.
+# 반대 방향 마감 + 갱신 방향 꼬리가 몸통보다 크거나 같음 +
+# RSI가 직전 스윙 피벗 대비 다이버전스 + 현재 캔들 거래량이 평소 대비
+# 유의미하게 터짐"이라는 동일한 뼈대를 공유하고, 방향만 반대입니다.
 #
 #  - 역망치 음봉(inverted_hammer_bearish):
-#      직전 스윙고점 대비 신고가 + 음봉(종가<시가) + 윗꼬리>=몸통*2 + 몸통 작음
-#      + RSI 하락 다이버전스(현재 RSI가 직전 스윙고점 RSI보다 갭 이상 낮음)
-#      → 상단에서 매도세 유입 신호
+#      직전 스윙고점 대비 신고가 + 음봉(종가<시가) + 윗꼬리>=몸통
+#      + RSI 하락 다이버전스(현재 RSI가 직전 스윙고점 RSI보다 낮음)
+#      + 거래량 급증(직전 평균 대비 VOLUME_SPIKE_MULTIPLIER배 이상)
+#      → 상단에서 강한 매도세 유입 신호
 #  - 망치 양봉(hammer_bullish):
-#      직전 스윙저점 대비 신저가 + 양봉(종가>시가) + 아랫꼬리>=몸통*2 + 몸통 작음
-#      + RSI 상승 다이버전스(현재 RSI가 직전 스윙저점 RSI보다 갭 이상 높음)
-#      → 하단에서 매수세 유입 신호
+#      직전 스윙저점 대비 신저가 + 양봉(종가>시가) + 아랫꼬리>=몸통
+#      + RSI 상승 다이버전스(현재 RSI가 직전 스윙저점 RSI보다 높음)
+#      + 거래량 급증(직전 평균 대비 VOLUME_SPIKE_MULTIPLIER배 이상)
+#      → 하단에서 강한 매수세 유입 신호
 
 
 def check_inverted_hammer_bearish(candles, rsi_series, lookback: int):
@@ -277,8 +311,12 @@ def check_inverted_hammer_bearish(candles, rsi_series, lookback: int):
 
     is_bearish_divergence = cur_rsi < prior_peak_rsi
 
-    ok = is_new_extreme and is_directional and is_shape_ok and is_bearish_divergence
+    # 거래량 급증 필터: 현재 캔들 거래량이 직전 구간 평균 대비 유의미하게 터졌는지
+    is_volume_ok, avg_volume = check_volume_spike(prior_window, v)
+
+    ok = is_new_extreme and is_directional and is_shape_ok and is_bearish_divergence and is_volume_ok
     extreme_diff_pct = ((h - c) / h * 100) if h != 0 else 0.0
+    volume_ratio = (v / avg_volume) if avg_volume > 0 else 0.0
 
     detail = {
         "open": o, "high": h, "low": l, "close": c,
@@ -287,11 +325,14 @@ def check_inverted_hammer_bearish(candles, rsi_series, lookback: int):
         "extreme_label": "신고가",
         "extreme_diff_pct": extreme_diff_pct,
         "extreme_diff_label": "고가 대비 종가 하락률",
-        "condition_label": "신고가 갱신 + 음봉 + 윗꼬리≥몸통 + 밑꼬리 짧음 + RSI 하락다이버전스(스윙피벗 기준, 최소 %d개 이전)" % MIN_PIVOT_DISTANCE,
+        "condition_label": "신고가 갱신 + 음봉 + 윗꼬리≥몸통 + 밑꼬리 짧음 + RSI 하락다이버전스(스윙피벗 기준, 최소 %d개 이전) + 거래량 급증(평균 대비 %.1f배 이상)" % (MIN_PIVOT_DISTANCE, VOLUME_SPIKE_MULTIPLIER),
         "cur_rsi": cur_rsi,
         "ref_rsi": prior_peak_rsi,
         "ref_price": prior_peak_high,
         "ref_label": "직전 스윙고점",
+        "cur_volume": v,
+        "avg_volume": avg_volume,
+        "volume_ratio": volume_ratio,
     }
     return ok, detail
 
@@ -340,8 +381,12 @@ def check_hammer_bullish(candles, rsi_series, lookback: int):
 
     is_bullish_divergence = cur_rsi > prior_trough_rsi
 
-    ok = is_new_extreme and is_directional and is_shape_ok and is_bullish_divergence
+    # 거래량 급증 필터: 현재 캔들 거래량이 직전 구간 평균 대비 유의미하게 터졌는지
+    is_volume_ok, avg_volume = check_volume_spike(prior_window, v)
+
+    ok = is_new_extreme and is_directional and is_shape_ok and is_bullish_divergence and is_volume_ok
     extreme_diff_pct = ((c - l) / l * 100) if l != 0 else 0.0
+    volume_ratio = (v / avg_volume) if avg_volume > 0 else 0.0
 
     detail = {
         "open": o, "high": h, "low": l, "close": c,
@@ -350,11 +395,14 @@ def check_hammer_bullish(candles, rsi_series, lookback: int):
         "extreme_label": "신저가",
         "extreme_diff_pct": extreme_diff_pct,
         "extreme_diff_label": "저가 대비 종가 상승률",
-        "condition_label": "신저가 갱신 + 양봉 + 아랫꼬리≥몸통 + 윗꼬리 짧음 + RSI 상승다이버전스(스윙피벗 기준, 최소 %d개 이전)" % MIN_PIVOT_DISTANCE,
+        "condition_label": "신저가 갱신 + 양봉 + 아랫꼬리≥몸통 + 윗꼬리 짧음 + RSI 상승다이버전스(스윙피벗 기준, 최소 %d개 이전) + 거래량 급증(평균 대비 %.1f배 이상)" % (MIN_PIVOT_DISTANCE, VOLUME_SPIKE_MULTIPLIER),
         "cur_rsi": cur_rsi,
         "ref_rsi": prior_trough_rsi,
         "ref_price": prior_trough_low,
         "ref_label": "직전 스윙저점",
+        "cur_volume": v,
+        "avg_volume": avg_volume,
+        "volume_ratio": volume_ratio,
     }
     return ok, detail
 
@@ -419,6 +467,7 @@ def check_symbol_timeframe(exchange, symbol, state, tf_conf, candles_cache):
                 f"{detail['wick_label']}: {detail['wick']:.6g} / {detail['opposite_wick_label']}: {detail['opposite_wick']:.6g}\n"
                 f"{detail['extreme_diff_label']}: {detail['extreme_diff_pct']:.2f}%\n"
                 f"RSI(현재): {detail['cur_rsi']:.2f} / RSI({detail['ref_label']}, {detail['ref_price']:.6g}): {detail['ref_rsi']:.2f}\n"
+                f"거래량(현재): {detail['cur_volume']:.6g} / 평균({VOLUME_AVG_LOOKBACK}개): {detail['avg_volume']:.6g} (x{detail['volume_ratio']:.2f})\n"
                 f"조건: 최근 {lookback}개 [{timeframe}] 캔들 중 {detail['condition_label']}\n\n"
                 f"하성하리아빠 화이팅입니다! 꼭 부자되시고 힘내세요!"
             )
@@ -507,7 +556,7 @@ def run_loop():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="OKX 캔들 신호 감시 봇 (15m/1h/4h, 역망치음봉/망치양봉 + RSI 다이버전스)")
+    parser = argparse.ArgumentParser(description="OKX 캔들 신호 감시 봇 (15m/1h/4h, 역망치음봉/망치양봉 + RSI 다이버전스 + 거래량 필터)")
     parser.add_argument("--once", action="store_true", help="1회만 체크하고 종료")
     args = parser.parse_args()
 
