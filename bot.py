@@ -28,6 +28,19 @@ OKX 무기한 선물(perpetual swap) 캔들 신호 감시 봇
   되어, 두 워크플로우가 같은 alert_state.json을 동시에 건드리다가
   git merge conflict가 나던 문제를 방지. 환경변수 STATE_FILE을 명시적으로
   지정하면 그 값이 항상 최우선.
+
+[2026-08 추가: BTC EMA20 추세 정보]
+- 텔레그램 신호 알람 메시지 하단에 "BTC가 EMA20선 기준으로 1시간봉/4시간봉에서
+  상승/하락/횡보 중 어느 상태인지" 참고 정보를 추가로 표시.
+- 판단 로직: 각 타임프레임(1h, 4h)에서 BTC 종가 EMA20을 계산한 뒤,
+    1) 현재 종가가 EMA20보다 위/아래에 있는지
+    2) EMA20 자체가 최근 EMA_TREND_LOOKBACK개 캔들 동안 얼마나 기울었는지(기울기 %)
+  두 조건을 함께 봐서: 종가>EMA20 이고 EMA20이 충분히 우상향 → "상승",
+  종가<EMA20 이고 EMA20이 충분히 우하향 → "하락", 그 외(추세가 약하거나
+  종가와 EMA20 위치가 기울기 방향과 어긋남) → "횡보" 로 판정.
+- 이 추세 정보는 신호 판정 자체에는 전혀 관여하지 않는 "참고용 표시"이며,
+  15분봉 전용(--group short) 실행에서는 계산/표시하지 않고, 1h/4h가 포함된
+  실행(--group long 또는 all)에서만 매 알람 메시지 하단에 함께 표시됨.
 """
 
 import ccxt
@@ -80,6 +93,14 @@ MIN_PIVOT_DISTANCE = 7
 # 상대순위/중앙값을 계산할 때 볼 직전 캔들 개수 (현재 캔들 제외, 가장 최근 것부터 이만큼).
 # None이면 lookback 구간 전체(prior_window)를 다 사용.
 VOLUME_AVG_LOOKBACK = 20
+
+# --- BTC EMA20 추세 표시 설정 (신호 판정에는 관여하지 않는 참고용 정보) ---
+BTC_TREND_SYMBOL_RAW = "BTC"
+EMA_PERIOD = 20             # 추세 판단에 쓸 EMA 기간
+EMA_TREND_LOOKBACK = 5      # EMA 기울기를 볼 때 몇 캔들 전과 비교할지
+EMA_TREND_THRESHOLD_PCT = 0.3   # 이 값(%) 이상 기울어야 "추세(상승/하락)"로 인정, 이하면 "횡보"
+EMA_TREND_TIMEFRAMES = ["1h", "4h"]  # 추세를 계산/표시할 타임프레임
+EMA_TREND_FETCH_COUNT = EMA_PERIOD + EMA_TREND_LOOKBACK + 50  # EMA 워밍업 포함 확보할 캔들 수
 
 # 루프 모드에서 깨어나는 주기(초). 가장 짧은 타임프레임(15m) 기준.
 TICK_INTERVAL_SEC = 15 * 60
@@ -234,6 +255,89 @@ def compute_rsi(closes, period: int = RSI_PERIOD):
         rsi[i] = 100.0 if avg_loss == 0 else 100 - (100 / (1 + avg_gain / avg_loss))
 
     return rsi
+
+
+# ============================== EMA / 추세 판단 (참고용, 신호 판정에는 미사용) ==============================
+
+
+def compute_ema(closes, period: int = EMA_PERIOD):
+    """표준 EMA. closes와 같은 길이의 리스트를 반환하며, 워밍업 구간
+    (index < period-1)은 None으로 채워집니다. 초기값은 첫 period개의
+    단순이동평균(SMA)으로 시작합니다."""
+    n = len(closes)
+    ema = [None] * n
+    if n < period:
+        return ema
+
+    multiplier = 2 / (period + 1)
+    sma = sum(closes[:period]) / period
+    ema[period - 1] = sma
+
+    for i in range(period, n):
+        ema[i] = (closes[i] - ema[i - 1]) * multiplier + ema[i - 1]
+
+    return ema
+
+
+def determine_ema_trend(
+    closes,
+    ema,
+    lookback: int = EMA_TREND_LOOKBACK,
+    threshold_pct: float = EMA_TREND_THRESHOLD_PCT,
+):
+    """현재 종가와 EMA20의 위치, 그리고 EMA20 자체의 최근 기울기(%)를 함께 보고
+    "상승" / "하락" / "횡보" 중 하나를 반환. 데이터가 부족하면 "판단불가"."""
+    if len(closes) < 1 or len(ema) < 1:
+        return "판단불가"
+
+    last_close = closes[-1]
+    last_ema = ema[-1]
+    if last_ema is None:
+        return "판단불가"
+
+    ref_idx = -1 - lookback
+    if len(ema) < lookback + 1 or ema[ref_idx] is None:
+        return "판단불가"
+
+    ref_ema = ema[ref_idx]
+    if ref_ema == 0:
+        return "판단불가"
+
+    slope_pct = (last_ema - ref_ema) / ref_ema * 100
+
+    if last_close > last_ema and slope_pct > threshold_pct:
+        return "상승"
+    elif last_close < last_ema and slope_pct < -threshold_pct:
+        return "하락"
+    else:
+        return "횡보"
+
+
+def fetch_btc_ema_trend_info(exchange: ccxt.okx) -> str:
+    """BTC의 1h/4h EMA20 기준 추세를 계산해서 텔레그램 메시지에 덧붙일
+    한 줄짜리 참고 정보 문자열을 만든다. 개별 타임프레임에서 오류가 나도
+    나머지 타임프레임 정보는 살리도록 타임프레임 단위로 감싼다."""
+    symbol = f"{BTC_TREND_SYMBOL_RAW}/USDT:USDT"
+    tf_ms_map = {t["tf"]: t["ms"] for t in TIMEFRAMES}
+
+    parts = []
+    for tf in EMA_TREND_TIMEFRAMES:
+        timeframe_ms = tf_ms_map.get(tf)
+        if timeframe_ms is None:
+            continue
+        try:
+            candles = fetch_closed_candles(exchange, symbol, tf, timeframe_ms, EMA_TREND_FETCH_COUNT)
+            closes = [cd[4] for cd in candles]
+            ema = compute_ema(closes, EMA_PERIOD)
+            trend = determine_ema_trend(closes, ema)
+            parts.append(f"{tf} {trend}")
+        except Exception as e:
+            log.error("BTC EMA20 추세 계산 실패 [%s]: %s", tf, e)
+            parts.append(f"{tf} 계산실패")
+
+    if not parts:
+        return ""
+    return "📊 BTC EMA20 추세: <b>" + " / ".join(parts) + "</b>"
 
 
 # ============================== PIVOT (스윙 고점/저점) ==============================
@@ -484,8 +588,13 @@ def fetch_closed_candles(exchange: ccxt.okx, symbol: str, timeframe: str, timefr
     return closed[-count:]
 
 
-def check_symbol_timeframe(exchange, symbol, state, tf_conf, candles_cache):
-    """한 심볼 x 한 타임프레임에 대해 캔들/RSI를 가져와서 등록된 모든 신호를 체크"""
+def check_symbol_timeframe(exchange, symbol, state, tf_conf, candles_cache, trend_info_text: str = ""):
+    """한 심볼 x 한 타임프레임에 대해 캔들/RSI를 가져와서 등록된 모든 신호를 체크
+
+    trend_info_text: 이번 실행에서 계산된 BTC EMA20 추세 참고 정보 문자열.
+                      비어있지 않으면 알람 메시지 맨 아래에 덧붙인다.
+                      (15분봉 전용 실행에서는 호출부에서 빈 문자열로 넘어옴)
+    """
     timeframe = tf_conf["tf"]
     timeframe_ms = tf_conf["ms"]
     lookback = tf_conf["lookback"]
@@ -530,20 +639,24 @@ def check_symbol_timeframe(exchange, symbol, state, tf_conf, candles_cache):
                 f"{detail['extreme_diff_label']}: {detail['extreme_diff_pct']:.2f}%\n"
                 f"RSI(현재): {detail['cur_rsi']:.2f} / RSI({detail['ref_label']}, {detail['ref_price']:.6g}): {detail['ref_rsi']:.2f}\n"
                 f"거래량(참고, 현재): {detail['cur_volume']:.6g} / 중앙값({VOLUME_AVG_LOOKBACK}개): {detail['median_volume']:.6g} (x{detail['volume_ratio_vs_median']:.2f}) / 상대순위: 상위 {100 - detail['volume_percentile']:.0f}%\n"
-                f"조건: 최근 {lookback}개 [{timeframe}] 캔들 중 {detail['condition_label']}\n\n"
-                f"하성하리아빠 화이팅입니다! 꼭 부자되시고 힘내세요!"
+                f"조건: 최근 {lookback}개 [{timeframe}] 캔들 중 {detail['condition_label']}\n"
             )
+            if trend_info_text:
+                msg += f"{trend_info_text}\n"
+            msg += "\n하성하리아빠 화이팅입니다! 꼭 부자되시고 힘내세요!"
             log.info("신호 발생: %s [%s] %s", symbol, timeframe, sig["name"])
             send_telegram(msg)
 
         state[key] = latest_candle_ts
 
 
-def check_all_symbols(exchange: ccxt.okx, symbols, state: dict, timeframes=None):
+def check_all_symbols(exchange: ccxt.okx, symbols, state: dict, timeframes=None, trend_info_text: str = ""):
     """모든 타임프레임 x 모든 신호 조합을 심볼별로 체크
 
     timeframes: 이번 실행에서 체크할 타임프레임 목록 (기본값: 전체 TIMEFRAMES).
                 --group 옵션으로 short/long 그룹만 골라서 넘길 수 있음.
+    trend_info_text: BTC EMA20 추세 참고 정보 문자열. 15분봉 전용(short) 실행에서는
+                      호출부에서 빈 문자열로 넘어와 메시지에 표시되지 않는다.
 
     타임프레임 하나에서 오류(네트워크 순단 등)가 나도 같은 심볼의
     나머지 타임프레임 체크는 계속 진행되도록, try/except를 타임프레임
@@ -556,7 +669,7 @@ def check_all_symbols(exchange: ccxt.okx, symbols, state: dict, timeframes=None)
         candles_cache = {}
         for tf_conf in timeframes:
             try:
-                check_symbol_timeframe(exchange, symbol, state, tf_conf, candles_cache)
+                check_symbol_timeframe(exchange, symbol, state, tf_conf, candles_cache, trend_info_text)
             except ccxt.BaseError as e:
                 log.error("[%s|%s] ccxt 오류: %s", symbol, tf_conf["tf"], e)
             except Exception as e:
@@ -582,6 +695,20 @@ def resolve_timeframes(group: str):
     return [t for t in TIMEFRAMES if t["group"] == group]
 
 
+def resolve_trend_info(exchange: ccxt.okx, timeframes) -> str:
+    """이번 실행에 1h 또는 4h 타임프레임이 포함되어 있을 때만 BTC EMA20
+    추세 정보를 계산해서 반환. 15분봉만 체크하는 실행(--group short)에서는
+    빈 문자열을 반환해 메시지에 아무것도 붙지 않게 한다."""
+    tf_names = {t["tf"] for t in timeframes}
+    if not (tf_names & set(EMA_TREND_TIMEFRAMES)):
+        return ""
+    try:
+        return fetch_btc_ema_trend_info(exchange)
+    except Exception as e:
+        log.error("BTC EMA20 추세 정보 계산 중 오류: %s", e)
+        return ""
+
+
 def run_once(group: str = "all"):
     # 외부 스케줄러(cron-job.org)가 정각에 정확히 이 실행을 트리거하므로,
     # 캔들이 거래소에 완전히 반영될 시간을 벌기 위해 여기서
@@ -603,6 +730,10 @@ def run_once(group: str = "all"):
         log.error("감시할 심볼이 하나도 없습니다.")
         return
 
+    trend_info_text = resolve_trend_info(exchange, timeframes)
+    if trend_info_text:
+        log.info("BTC EMA20 추세 정보: %s", trend_info_text)
+
     state = load_state(state_file)
     log.info(
         "1회성 체크 실행 (%d개 심볼, group=%s, 타임프레임: %s, 신호: %s)",
@@ -611,7 +742,7 @@ def run_once(group: str = "all"):
         ", ".join(t["tf"] for t in timeframes),
         ", ".join(s["name"] for s in SIGNALS),
     )
-    check_all_symbols(exchange, symbols, state, timeframes)
+    check_all_symbols(exchange, symbols, state, timeframes, trend_info_text)
     save_state(state, state_file)
 
 
@@ -644,12 +775,15 @@ def run_loop(group: str = "all"):
         log.info("다음 체크 틱까지 %.0f초 대기", wait_sec)
         time.sleep(wait_sec)
         log.info("틱 발생 → 전 타임프레임/전 신호/전 종목 조건 체크 시작")
-        check_all_symbols(exchange, symbols, state, timeframes)
+        trend_info_text = resolve_trend_info(exchange, timeframes)
+        if trend_info_text:
+            log.info("BTC EMA20 추세 정보: %s", trend_info_text)
+        check_all_symbols(exchange, symbols, state, timeframes, trend_info_text)
         save_state(state, state_file)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="OKX 캔들 신호 감시 봇 (15m/1h/4h, 역망치음봉/망치양봉 + RSI 다이버전스, 거래량은 참고용 표시만)")
+    parser = argparse.ArgumentParser(description="OKX 캔들 신호 감시 봇 (15m/1h/4h, 역망치음봉/망치양봉 + RSI 다이버전스, 거래량은 참고용 표시만, 1h/4h 실행에서는 BTC EMA20 추세도 함께 표시)")
     parser.add_argument("--once", action="store_true", help="1회만 체크하고 종료")
     parser.add_argument(
         "--group",
