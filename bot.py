@@ -1,12 +1,11 @@
 """
 OKX 무기한 선물(perpetual swap) 캔들 신호 감시 봇
-- 타임프레임: 15분봉 / 1시간봉 / 4시간봉
+- 타임프레임: 15분봉 / 1시간봉 / 2시간봉 / 4시간봉 / 12시간봉 / 1일봉
 - 신호 패턴: 역망치형 음봉(고점 갱신 실패형 매도세) / 망치형 양봉(저점 갱신 후 매수세)
 - 추가 필터: RSI 다이버전스 (진짜 스윙 피벗 기준)
     * 역망치 음봉: 신고가 갱신 + RSI는 "최소 MIN_PIVOT_DISTANCE개 이전의 스윙 고점"보다 낮음
     * 망치 양봉  : 신저가 갱신 + RSI는 "최소 MIN_PIVOT_DISTANCE개 이전의 스윙 저점"보다 높음
-    * 거래량은 신호 판정 조건에서 제외됨 (참고용으로 메시지에만 표시).
-      신호 발생 시 거래량 수준은 사용자가 직접 보고 진입 여부를 판단.
+    * 거래량 조건은 완전히 제거됨. 신호 발생 시 거래량은 사용자가 직접 차트에서 보고 판단.
 
 [2026-08 수정사항]
 - 다이버전스 비교 기준을 "lookback 구간 내 단순 최고/최저 캔들"에서
@@ -17,11 +16,9 @@ OKX 무기한 선물(perpetual swap) 캔들 신호 감시 봇
   이상 떨어져 있어야만 후보로 인정. → 너무 최근(바로 몇 캔들 전)의
   피벗을 기준 삼아 생기던 노이즈성 신호 방지.
 - 캔들 꼬리/몸통 모양 조건은 원래 기준(꼬리>=몸통) 그대로 유지.
-- 감시 타임프레임에서 12h, 1d 제거 (15m/1h/4h만 감시).
-- [제거] 거래량 상대순위(백분위) 필터를 신호 판정 조건에서 제외함.
-  → 캔들 모양/다이버전스 조건만 맞으면 거래량 수준과 무관하게 신호가 발생.
-  거래량(현재값/직전 구간 중앙값/백분위)은 여전히 계산되어 텔레그램
-  메시지에 참고용으로 표시되며, 진입 여부 판단은 사용자가 직접 함.
+- 감시 타임프레임: 15m / 1h / 2h / 4h / 12h / 1d.
+- [제거] 거래량 관련 조건/계산/표시를 코드에서 전부 제거함. 신호 판정에도,
+  참고용 표시에도 더 이상 거래량을 사용하지 않음.
 - [신규] 상태 파일(STATE_FILE)을 --group 값에 따라 자동으로 분리
   (alert_state_short.json / alert_state_long.json). 15분마다 도는
   워크플로우와 1시간마다 도는 워크플로우가 서로 다른 파일을 커밋하게
@@ -62,14 +59,16 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "여기에_챗ID_입력")
 #        딱 그만큼만 자주 체크하도록 나눠서, 불필요한 API 호출/Actions 사용량을 줄인다.
 #   "short" = 15분마다 도는 워크플로우에서 체크 (15m 캔들은 15분마다 마감되므로
 #             이 주기로 체크해야만 놓치지 않음)
-#   "long"  = 1시간마다 도는 워크플로우에서 체크 (1h/4h는 어차피 캔들이 1시간
+#   "long"  = 1시간마다 도는 워크플로우에서 체크 (1h 이상은 어차피 캔들이 1시간
 #             단위 이상으로만 마감되므로, 15분마다 체크해봤자 대부분 "아직
 #             그대로"라 API 호출만 낭비. 1시간 주기로 체크해도 놓치는 캔들 없음)
 TIMEFRAMES = [
     {"tf": "15m", "ms": 15 * 60 * 1000, "lookback": 30, "group": "short"},
     {"tf": "1h", "ms": 60 * 60 * 1000, "lookback": 30, "group": "long"},
+    {"tf": "2h", "ms": 2 * 60 * 60 * 1000, "lookback": 30, "group": "long"},
     {"tf": "4h", "ms": 4 * 60 * 60 * 1000, "lookback": 30, "group": "long"},
     {"tf": "12h", "ms": 12 * 60 * 60 * 1000, "lookback": 30, "group": "long"},
+    {"tf": "1d", "ms": 24 * 60 * 60 * 1000, "lookback": 30, "group": "long"},
 ]
 
 # RSI 설정
@@ -88,11 +87,6 @@ PIVOT_RIGHT = 2
 # 다이버전스 비교 기준으로 쓸 스윙 피벗은 현재 캔들로부터 최소 이만큼(개수) 떨어져 있어야 함
 # → 너무 가까운(직전 몇 개 캔들 안의) 피벗을 기준으로 삼아서 생기는 노이즈성 신호 방지
 MIN_PIVOT_DISTANCE = 7
-
-# --- 거래량 참고 지표 설정 (신호 판정에는 더 이상 사용하지 않음, 메시지 표시용) ---
-# 상대순위/중앙값을 계산할 때 볼 직전 캔들 개수 (현재 캔들 제외, 가장 최근 것부터 이만큼).
-# None이면 lookback 구간 전체(prior_window)를 다 사용.
-VOLUME_AVG_LOOKBACK = 20
 
 # --- BTC EMA20 추세 표시 설정 (신호 판정에는 관여하지 않는 참고용 정보) ---
 BTC_TREND_SYMBOL_RAW = "BTC"
@@ -369,57 +363,12 @@ def find_pivot_lows(window, left: int = PIVOT_LEFT, right: int = PIVOT_RIGHT):
     return pivots
 
 
-# ============================== VOLUME (참고용 지표, 신호 판정에는 미사용) ==============================
-
-
-def compute_median(values):
-    """정렬 후 가운데 값(짝수개면 가운데 두 값의 평균)을 반환. 이상치 캔들 하나에
-    쉽게 끌려가는 평균과 달리, 중앙값은 그런 이상치에 강건해서 "평소 거래량"을
-    더 대표성 있게 보여줌 (참고 표시용)."""
-    if not values:
-        return 0.0
-    s = sorted(values)
-    n = len(s)
-    mid = n // 2
-    if n % 2 == 1:
-        return s[mid]
-    return (s[mid - 1] + s[mid]) / 2
-
-
-def compute_percentile_rank(ref_values, current_value):
-    """ref_values(직전 캔들들의 거래량 목록) 중 current_value보다 작거나 같은
-    값의 비율을 0~100 백분위로 반환. 예: 반환값 80 → 직전 구간 캔들의 80%보다
-    현재 거래량이 크거나 같다는 뜻 (=상위 20%). 신호 판정에는 사용하지 않고
-    메시지 표시용 참고 지표로만 사용."""
-    if not ref_values:
-        return 0.0
-    count_le = sum(1 for v in ref_values if v <= current_value)
-    return (count_le / len(ref_values)) * 100.0
-
-
-def compute_volume_stats(prior_window, current_volume, avg_lookback=VOLUME_AVG_LOOKBACK):
-    """현재 캔들 거래량의 직전 구간 대비 백분위 순위와 중앙값을 계산.
-    신호 판정 조건에는 더 이상 쓰이지 않고, 텔레그램 메시지에 참고용으로만
-    표시됨 (진입 여부는 사용자가 직접 판단). avg_lookback이 주어지면 prior_window
-    중 가장 최근 그만큼만 기준 구간으로 사용, None이면 prior_window 전체 사용.
-    반환값: (백분위순위, 중앙값)"""
-    if not prior_window:
-        return 0.0, 0.0
-    ref_candles = prior_window[-avg_lookback:] if avg_lookback else prior_window
-    if not ref_candles:
-        return 0.0, 0.0
-    ref_volumes = [cd[5] for cd in ref_candles]
-    percentile = compute_percentile_rank(ref_volumes, current_volume)
-    median_volume = compute_median(ref_volumes)
-    return percentile, median_volume
-
-
 # ============================== SIGNAL DEFINITIONS ==============================
 #
 # 두 신호 모두 "직전 스윙 극값 대비 현재 캔들이 극값을 갱신 +
 # 반대 방향 마감 + 갱신 방향 꼬리가 몸통보다 크거나 같음 +
 # RSI가 직전 스윙 피벗 대비 다이버전스"라는 동일한 뼈대를 공유하고,
-# 방향만 반대입니다. 거래량은 판정 조건이 아니며 참고용으로만 계산/표시됩니다.
+# 방향만 반대입니다. 거래량은 더 이상 계산/사용하지 않습니다.
 #
 #  - 역망치 음봉(inverted_hammer_bearish):
 #      직전 스윙고점 대비 신고가 + 음봉(종가<시가) + 윗꼬리>=몸통
@@ -475,12 +424,8 @@ def check_inverted_hammer_bearish(candles, rsi_series, lookback: int):
 
     is_bearish_divergence = cur_rsi < prior_peak_rsi
 
-    # 거래량은 참고용 지표로만 계산 (판정에는 반영하지 않음)
-    volume_percentile, median_volume = compute_volume_stats(prior_window, v)
-
     ok = is_new_extreme and is_directional and is_shape_ok and is_bearish_divergence
     extreme_diff_pct = ((h - c) / h * 100) if h != 0 else 0.0
-    volume_ratio_vs_median = (v / median_volume) if median_volume > 0 else 0.0
 
     detail = {
         "open": o, "high": h, "low": l, "close": c,
@@ -494,10 +439,6 @@ def check_inverted_hammer_bearish(candles, rsi_series, lookback: int):
         "ref_rsi": prior_peak_rsi,
         "ref_price": prior_peak_high,
         "ref_label": "직전 스윙고점",
-        "cur_volume": v,
-        "median_volume": median_volume,
-        "volume_percentile": volume_percentile,
-        "volume_ratio_vs_median": volume_ratio_vs_median,
     }
     return ok, detail
 
@@ -546,12 +487,8 @@ def check_hammer_bullish(candles, rsi_series, lookback: int):
 
     is_bullish_divergence = cur_rsi > prior_trough_rsi
 
-    # 거래량은 참고용 지표로만 계산 (판정에는 반영하지 않음)
-    volume_percentile, median_volume = compute_volume_stats(prior_window, v)
-
     ok = is_new_extreme and is_directional and is_shape_ok and is_bullish_divergence
     extreme_diff_pct = ((c - l) / l * 100) if l != 0 else 0.0
-    volume_ratio_vs_median = (v / median_volume) if median_volume > 0 else 0.0
 
     detail = {
         "open": o, "high": h, "low": l, "close": c,
@@ -565,10 +502,6 @@ def check_hammer_bullish(candles, rsi_series, lookback: int):
         "ref_rsi": prior_trough_rsi,
         "ref_price": prior_trough_low,
         "ref_label": "직전 스윙저점",
-        "cur_volume": v,
-        "median_volume": median_volume,
-        "volume_percentile": volume_percentile,
-        "volume_ratio_vs_median": volume_ratio_vs_median,
     }
     return ok, detail
 
@@ -638,7 +571,6 @@ def check_symbol_timeframe(exchange, symbol, state, tf_conf, candles_cache, tren
                 f"{detail['wick_label']}: {detail['wick']:.6g} / {detail['opposite_wick_label']}: {detail['opposite_wick']:.6g}\n"
                 f"{detail['extreme_diff_label']}: {detail['extreme_diff_pct']:.2f}%\n"
                 f"RSI(현재): {detail['cur_rsi']:.2f} / RSI({detail['ref_label']}, {detail['ref_price']:.6g}): {detail['ref_rsi']:.2f}\n"
-                f"거래량(참고, 현재): {detail['cur_volume']:.6g} / 중앙값({VOLUME_AVG_LOOKBACK}개): {detail['median_volume']:.6g} (x{detail['volume_ratio_vs_median']:.2f}) / 상대순위: 상위 {100 - detail['volume_percentile']:.0f}%\n"
                 f"조건: 최근 {lookback}개 [{timeframe}] 캔들 중 {detail['condition_label']}\n"
             )
             if trend_info_text:
@@ -783,13 +715,13 @@ def run_loop(group: str = "all"):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="OKX 캔들 신호 감시 봇 (15m/1h/4h, 역망치음봉/망치양봉 + RSI 다이버전스, 거래량은 참고용 표시만, 1h/4h 실행에서는 BTC EMA20 추세도 함께 표시)")
+    parser = argparse.ArgumentParser(description="OKX 캔들 신호 감시 봇 (15m/1h/2h/4h/12h/1d, 역망치음봉/망치양봉 + RSI 다이버전스, 1h/4h 실행에서는 BTC EMA20 추세도 함께 표시)")
     parser.add_argument("--once", action="store_true", help="1회만 체크하고 종료")
     parser.add_argument(
         "--group",
         choices=["all", "short", "long"],
         default="all",
-        help="체크할 타임프레임 그룹 (short=15m, long=1h/4h, all=전체). 기본값 all",
+        help="체크할 타임프레임 그룹 (short=15m, long=1h/2h/4h/12h/1d, all=전체). 기본값 all",
     )
     args = parser.parse_args()
 
