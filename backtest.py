@@ -52,6 +52,10 @@ from bot import (
 
 BACKTEST_MONTHS = 6      # 몇 개월치 과거 데이터를 볼지
 
+# 결과에 레버리지를 반영해서 보여줄 배수. 실전 봇에서 쓰는 고정 3배와 맞춤.
+# 가격 변동률(%)에 그대로 곱하는 방식이라 수수료/펀딩비/슬리피지는 반영되지 않음.
+LEVERAGE = 3
+
 # [방식 1] 신호 발생 이후 몇 개 캔들까지의 움직임으로 성공/실패를 판정할지.
 # 여러 개를 넣으면 각각에 대한 결과를 한 번의 백테스트로 같이 뽑습니다.
 FOLLOW_CANDLES_LIST = [5, 10]
@@ -282,6 +286,7 @@ def run_backtest() -> pd.DataFrame:
                             **base_row,
                             "추적기준": f"{follow_n}봉",
                             "수익률(%)": round(outcome["pnl_pct"], 2),
+                            f"수익률({LEVERAGE}x,%)": round(outcome["pnl_pct"] * LEVERAGE, 2),
                             "최대유리(%)": round(outcome["best_pct"], 2),
                             "최대불리(%)": round(outcome["worst_pct"], 2),
                             "체결까지_걸린봉수": None,
@@ -297,6 +302,7 @@ def run_backtest() -> pd.DataFrame:
                             **base_row,
                             "추적기준": TP_SL_LABEL,
                             "수익률(%)": round(tpsl["pnl_pct"], 2),
+                            f"수익률({LEVERAGE}x,%)": round(tpsl["pnl_pct"] * LEVERAGE, 2),
                             "최대유리(%)": None,
                             "최대불리(%)": None,
                             "체결까지_걸린봉수": tpsl["bars_to_result"],
@@ -336,28 +342,31 @@ def build_summary(df: pd.DataFrame) -> str:
             lines.append("해당 없음")
             continue
 
+        lev_col = f"수익률({LEVERAGE}x,%)"
         total = len(sub)
         win_rate = (sub["성공여부"] == "성공").mean() * 100
         avg_pnl = sub["수익률(%)"].mean()
+        avg_pnl_lev = sub[lev_col].mean()
 
         lines.append(f"전체 신호 수: {total}건")
         lines.append(f"전체 승률: {win_rate:.1f}%")
-        lines.append(f"전체 평균 수익률: {avg_pnl:.2f}%")
+        lines.append(f"전체 평균 수익률: {avg_pnl:.2f}% (레버리지 {LEVERAGE}x 반영시 {avg_pnl_lev:.2f}%)")
 
         lines.append("── 타임프레임별 ──")
         for tf, g in sub.groupby("타임프레임"):
             lines.append(
-                f"[{tf}] {len(g)}건 / 승률 {(g['성공여부']=='성공').mean()*100:.1f}% / 평균 {g['수익률(%)'].mean():.2f}%"
+                f"[{tf}] {len(g)}건 / 승률 {(g['성공여부']=='성공').mean()*100:.1f}% / 평균 {g['수익률(%)'].mean():.2f}% ({LEVERAGE}x: {g[lev_col].mean():.2f}%)"
             )
 
         lines.append("── 신호 유형별 ──")
         for sig, g in sub.groupby("신호"):
             lines.append(
-                f"{sig}: {len(g)}건 / 승률 {(g['성공여부']=='성공').mean()*100:.1f}% / 평균 {g['수익률(%)'].mean():.2f}%"
+                f"{sig}: {len(g)}건 / 승률 {(g['성공여부']=='성공').mean()*100:.1f}% / 평균 {g['수익률(%)'].mean():.2f}% ({LEVERAGE}x: {g[lev_col].mean():.2f}%)"
             )
 
     lines.append("")
     lines.append(f"※ {TP_SL_LABEL} 기준은 진입방향 기준 +{TP_PCT:g}% 도달 시 익절, -{SL_PCT:g}% 도달 시 손절로 판정했습니다.")
+    lines.append(f"※ ({LEVERAGE}x) 표시는 레버리지 {LEVERAGE}배 반영 수익률이며, 수수료/펀딩비/슬리피지는 포함되지 않습니다.")
     lines.append("(종목·시각별 상세 내역은 첨부된 엑셀 파일 참고)")
     return "\n".join(lines)
 
@@ -370,9 +379,10 @@ def build_breakdown(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=[
             "종목", "순번", "타임프레임", "신호", "추적기준",
-            "신호건수", "승률(%)", "평균수익률(%)",
+            "신호건수", "승률(%)", "평균수익률(%)", f"평균수익률({LEVERAGE}x,%)",
         ])
 
+    lev_col = f"수익률({LEVERAGE}x,%)"
     rows = []
     for (symbol, rank, tf, sig, label), g in df.groupby(["종목", "순번", "타임프레임", "신호", "추적기준"]):
         rows.append({
@@ -384,6 +394,7 @@ def build_breakdown(df: pd.DataFrame) -> pd.DataFrame:
             "신호건수": len(g),
             "승률(%)": round((g["성공여부"] == "성공").mean() * 100, 1),
             "평균수익률(%)": round(g["수익률(%)"].mean(), 2),
+            f"평균수익률({LEVERAGE}x,%)": round(g[lev_col].mean(), 2),
         })
 
     breakdown = pd.DataFrame(rows)
